@@ -1051,327 +1051,270 @@ $('#newChatBtn').addEventListener('click', () => {
 /* ================================================================== */
 /* File browser                                                        */
 /* ================================================================== */
-const fileBrowser = $('#fileBrowser');
-const fileViewer  = $('#fileViewer');
-const messagesArea = $('#messages');
-const inputArea    = $('.input-area');
-const fbList       = $('#fbList');
-const fbPath       = $('#fbPath');
-const fbBack       = $('#fbBack');
-const fbClose      = $('#fbClose');
-const fvName       = $('#fvName');
-const fvContent    = $('#fvContent');
-const fvBack       = $('#fvBack');
-const fvClose      = $('#fvClose');
+const fileBrowser   = $('#fileBrowser');
+const fileViewer    = $('#fileViewer');
+const messagesElRef = $('#messages');
+const inputArea     = $('.input-area');
+const fbList        = $('#fbList');
+const fbPath        = $('#fbPath');
+const fbBack        = $('#fbBack');
+const fbClose       = $('#fbClose');
+const fvName        = $('#fvName');
+const fvContentEl   = $('#fvContent');
+const fvContentEdit = $('#fvContentEdit');
+const fvBack        = $('#fvBack');
+const fvClose       = $('#fvClose');
 
-let fbCurrentPath = '/opt/agent/workspace';
-let fbHistory = [];
+let fbDir  = '/opt/agent/workspace';   // current browsing directory
+let fbHist = [];                        // navigation stack
+let fbViewPath = '';                    // path of file currently being viewed
+
+/* ---------- view toggling ---------- */
 
 function showChat() {
-  document.body.classList.remove('viewing-files');
-  fileBrowser.style.display = 'none';
-  fileViewer.style.display = 'none';
-  messagesArea.style.display = '';
-  inputArea.style.display = '';
+  fileBrowser.style.display  = 'none';
+  fileViewer.style.display   = 'none';
+  messagesElRef.style.display = '';
+  inputArea.style.display    = '';
 }
 
 function showFileBrowser() {
-  document.body.classList.add('viewing-files');
-  messagesArea.style.display = 'none';
-  inputArea.style.display = 'none';
-  fileViewer.style.display = 'none';
-  fileBrowser.style.display = 'flex';
-  loadDirectory(fbCurrentPath);
+  messagesElRef.style.display = 'none';
+  inputArea.style.display    = 'none';
+  fileViewer.style.display   = 'none';
+  fileBrowser.style.display  = 'flex';
+  loadDir(fbDir);
 }
 
-function formatSize(bytes) {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
-  return (bytes / 1048576).toFixed(1) + ' MB';
+function showFileViewer() {
+  fileBrowser.style.display  = 'none';
+  fileViewer.style.display   = 'flex';
+  fvContentEl.style.display  = 'block';
+  fvContentEdit.style.display = 'none';
 }
 
-function formatTime(ts) {
-  const d = new Date(ts * 1000);
-  return d.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' });
+/* ---------- helpers ---------- */
+
+function fmtSize(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+  return (b / 1048576).toFixed(1) + ' MB';
 }
 
-async function loadDirectory(dirPath) {
-  fbCurrentPath = dirPath;
+function fileIcon(name, isDir) {
+  if (isDir) return '📁';
+  if (/\.(md|txt|log)$/i.test(name)) return '📝';
+  if (/\.(py|js|ts|go|rs|java|c|cpp|sh)$/i.test(name)) return '💻';
+  if (/\.(json|yaml|yml|toml|ini|cfg)$/i.test(name)) return '⚙';
+  if (/\.(html|css|svg)$/i.test(name)) return '🌐';
+  return '📄';
+}
+
+/* ---------- directory listing ---------- */
+
+async function loadDir(dirPath) {
+  fbDir = dirPath;
   fbPath.textContent = dirPath.replace('/opt/agent/', '~/');
-  fbBack.style.visibility = (dirPath === '/opt/agent/workspace' && fbHistory.length === 0) ? 'hidden' : '';
+  fbBack.style.visibility = (fbHist.length === 0) ? 'hidden' : '';
+
+  fbList.innerHTML = '<div class="fb-empty">加载中…</div>';
 
   try {
-    const res = await fetch(`/api/files?path=${encodeURIComponent(dirPath)}`, { headers: getAuthHeaders() });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const res = await fetch('/api/files?path=' + encodeURIComponent(dirPath), { headers: getAuthHeaders() });
+    if (!res.ok) throw new Error('HTTP ' + res.status + (res.status === 401 ? ' (请先设置令牌)' : ''));
     const data = await res.json();
 
     if (data.type !== 'dir') {
-      // shouldn't happen, but handle
+      fbList.innerHTML = '<div class="fb-empty">不是目录</div>';
       return;
     }
-
     if (!data.entries || !data.entries.length) {
-      fbList.innerHTML = '<div class="fb-empty">空目录</div>';
+      fbList.innerHTML = '<div class="fb-empty">空目录 — 点 ＋ 新建文件</div>';
       return;
     }
 
     fbList.innerHTML = data.entries.map(e => {
-      let icon = e.is_dir ? '📁' : '📄';
       const name = e.name;
-      // refine icon by extension
-      if (!e.is_dir) {
-        if (/\.(md|txt|log)$/i.test(name)) icon = '📝';
-        else if (/\.(py|js|ts|go|rs|java|c|cpp|sh|bash|zsh)$/i.test(name)) icon = '💻';
-        else if (/\.(json|yaml|yml|toml|ini|cfg|conf|env)$/i.test(name)) icon = '⚙';
-        else if (/\.(html|css|svg)$/i.test(name)) icon = '🌐';
-        else if (/\.(png|jpg|jpeg|gif|webp|ico)$/i.test(name)) icon = '🖼';
-      }
-      const meta = e.is_dir ? '目录' : formatSize(e.size);
-      return `
-        <div class="fb-item" data-name="${escapeHtml(name)}" data-is-dir="${e.is_dir}">
-          <span class="fb-icon">${icon}</span>
-          <span class="fb-name">${escapeHtml(name)}${e.is_dir ? '/' : ''}</span>
-          <span class="fb-meta">${meta}</span>
-          <button class="fb-del" data-del="${escapeHtml(name)}" title="删除">×</button>
-        </div>`;
+      const icon = fileIcon(name, e.is_dir);
+      const meta = e.is_dir ? '目录' : fmtSize(e.size);
+      return `<div class="fb-item" data-name="${escapeHtml(name)}" data-is-dir="${e.is_dir}">
+        <span class="fb-icon">${icon}</span>
+        <span class="fb-name">${escapeHtml(name)}${e.is_dir ? '/' : ''}</span>
+        <span class="fb-meta">${meta}</span>
+        <button class="fb-del">×</button>
+      </div>`;
     }).join('');
 
-    // click handlers
+    // bind events
     fbList.querySelectorAll('.fb-item').forEach(el => {
-      el.addEventListener('click', (e) => {
-        // ignore clicks on delete button
+      el.addEventListener('click', function(e) {
         if (e.target.classList.contains('fb-del')) return;
-        const name = el.dataset.name;
-        const isDir = el.dataset.is_dir === 'true';
-        const fullPath = dirPath + '/' + name;
-        if (isDir) {
-          fbHistory.push(dirPath);
-          loadDirectory(fullPath);
+        const name = this.dataset.name;
+        const full = dirPath + '/' + name;
+        if (this.dataset.isDir === 'true') {
+          fbHist.push(dirPath);
+          loadDir(full);
         } else {
-          viewFile(fullPath, name);
+          openFile(full, name);
         }
       });
-      // delete button
-      const delBtn = el.querySelector('.fb-del');
-      if (delBtn) {
-        delBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          const name = el.dataset.name;
-          const fullPath = dirPath + '/' + name;
-          deleteFile(fullPath);
-        });
-      }
+      const del = el.querySelector('.fb-del');
+      if (del) del.addEventListener('click', function(e) {
+        e.stopPropagation();
+        removeFile(dirPath + '/' + this.parentElement.dataset.name);
+      });
     });
+
   } catch (err) {
-    fbList.innerHTML = `<div class="fb-empty">加载失败: ${escapeHtml(err.message)}</div>`;
+    fbList.innerHTML = '<div class="fb-empty">⚠ ' + escapeHtml(err.message) + '</div>';
   }
 }
 
-async function viewFile(filePath, name) {
+/* ---------- file viewing ---------- */
+
+async function openFile(filePath, name) {
+  fbViewPath = filePath;
+  fvName.textContent = name;
+  showFileViewer();
+  fvContentEl.textContent = '加载中…';
+
   try {
-    const res = await fetch(`/api/files?path=${encodeURIComponent(filePath)}`, { headers: getAuthHeaders() });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const res = await fetch('/api/files?path=' + encodeURIComponent(filePath), { headers: getAuthHeaders() });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
-
-    fvName.textContent = name;
-    fvContent.textContent = data.content || '(空文件)';
-    fileBrowser.style.display = 'none';
-    fileViewer.style.display = 'flex';
+    fvContentEl.textContent = data.content || '(空文件)';
   } catch (err) {
-    alert('读取失败: ' + err.message);
+    fvContentEl.textContent = '⚠ 读取失败: ' + err.message;
   }
 }
 
-fbBack.addEventListener('click', () => {
-  if (fbHistory.length) {
-    loadDirectory(fbHistory.pop());
-  }
-});
+/* ---------- create ---------- */
 
-fbClose.addEventListener('click', showChat);
+const createOverlay = $('#createOverlay');
+const createName   = $('#createName');
+const createText   = $('#createContent');
+const createStatus = $('#createStatus');
 
-fvBack.addEventListener('click', () => {
-  fileViewer.style.display = 'none';
-  fileBrowser.style.display = 'flex';
-  loadDirectory(fbCurrentPath);
-});
-
-fvClose.addEventListener('click', showChat);
-
-/* --- File operations: create, delete, edit, upload --- */
-
-const createOverlay  = $('#createOverlay');
-const createName     = $('#createName');
-const createContent  = $('#createContent');
-const createStatus   = $('#createStatus');
-const createTitle    = $('#createTitle');
-const createConfirm  = $('#createConfirm');
-
-// Create modal
-$('#fbCreate').addEventListener('click', () => {
-  createTitle.textContent = '新建';
+$('#fbCreate').addEventListener('click', function() {
   createName.value = '';
-  createContent.value = '';
+  createText.value = '';
   createStatus.textContent = '';
   createStatus.className = 'status-msg';
   createOverlay.classList.add('show');
   createName.focus();
 });
 
-createOverlay.addEventListener('click', (e) => {
+createOverlay.addEventListener('click', function(e) {
   if (e.target === createOverlay) createOverlay.classList.remove('show');
 });
-$('#createCancel').addEventListener('click', () => createOverlay.classList.remove('show'));
+$('#createCancel').addEventListener('click', function() {
+  createOverlay.classList.remove('show');
+});
 
-createConfirm.addEventListener('click', async () => {
+$('#createConfirm').addEventListener('click', async function() {
   const name = createName.value.trim();
   if (!name) { createStatus.textContent = '请输入文件名'; createStatus.className = 'status-msg err'; return; }
-
-  const content = createContent.value;
-  const basePath = fbCurrentPath;
-  // if relative, join with current browsing dir
-  let fullPath = name.startsWith('/') ? name : basePath + '/' + name;
-
+  const full = name.startsWith('/') ? name : fbDir + '/' + name;
   try {
-    const res = await fetch('/api/files', {
-      method: 'POST',
-      headers: getAuthHeaders(),
-      body: JSON.stringify({ path: fullPath, content }),
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || `HTTP ${res.status}`);
-    }
+    const res = await fetch('/api/files', { method: 'POST', headers: getAuthHeaders(), body: JSON.stringify({ path: full, content: createText.value }) });
+    if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'HTTP '+res.status); }
     createStatus.textContent = '✓ 已创建';
     createStatus.className = 'status-msg ok';
-    setTimeout(() => createOverlay.classList.remove('show'), 600);
-    loadDirectory(fbCurrentPath);
+    setTimeout(function() { createOverlay.classList.remove('show'); }, 600);
+    loadDir(fbDir);
   } catch (err) {
     createStatus.textContent = '失败: ' + err.message;
     createStatus.className = 'status-msg err';
   }
 });
 
-// Upload
-$('#fbUpload').addEventListener('click', () => {
-  $('#fbUploadInput').click();
-});
+/* ---------- upload ---------- */
 
-$('#fbUploadInput').addEventListener('change', async () => {
-  const files = $('#fbUploadInput').files;
+$('#fbUpload').addEventListener('click', function() { $('#fbUploadInput').click(); });
+$('#fbUploadInput').addEventListener('change', async function() {
+  const files = this.files;
   if (!files.length) return;
-
-  let uploaded = 0;
-  for (const file of files) {
-    const text = await file.text();
-    const fullPath = fbCurrentPath + '/' + file.name;
+  for (const f of files) {
     try {
-      const res = await fetch('/api/files', {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ path: fullPath, content: text }),
-      });
-      if (res.ok) uploaded++;
+      const text = await f.text();
+      await fetch('/api/files', { method: 'POST', headers: getAuthHeaders(), body: JSON.stringify({ path: fbDir+'/'+f.name, content: text }) });
     } catch {}
   }
-  $('#fbUploadInput').value = '';
-  loadDirectory(fbCurrentPath);
+  this.value = '';
+  loadDir(fbDir);
 });
 
-// Delete file (from file list)
-async function deleteFile(path) {
-  if (!confirm(`确定删除 ${path.split('/').pop()}？`)) return;
+/* ---------- delete ---------- */
+
+async function removeFile(path) {
+  if (!confirm('确定删除 ' + path.split('/').pop() + '？')) return;
   try {
-    const res = await fetch(`/api/files?path=${encodeURIComponent(path)}`, {
-      method: 'DELETE',
-      headers: getAuthHeaders(),
-    });
-    if (!res.ok) {
-      const err = await res.json();
-      alert('删除失败: ' + (err.detail || res.status));
-    }
-    loadDirectory(fbCurrentPath);
-  } catch (err) {
-    alert('删除失败: ' + err.message);
-  }
+    const res = await fetch('/api/files?path=' + encodeURIComponent(path), { method: 'DELETE', headers: getAuthHeaders() });
+    if (!res.ok) { const e = await res.json(); throw new Error(e.detail); }
+    loadDir(fbDir);
+  } catch (err) { alert('删除失败: ' + err.message); }
 }
 
-// Edit file (from viewer)
-$('#fvEdit').addEventListener('click', () => {
-  const content = fvContent.textContent;
-  fvContent.style.display = 'none';
+$('#fvDelete').addEventListener('click', function() { if (fbViewPath) removeFile(fbViewPath); });
+
+/* ---------- edit ---------- */
+
+$('#fvEdit').addEventListener('click', function() {
+  fvContentEdit.value = fvContentEl.textContent;
+  fvContentEl.style.display = 'none';
   fvContentEdit.style.display = '';
-  fvContentEdit.value = content;
   fvContentEdit.focus();
 });
 
-
-// Download from viewer
-$('#fvDownload').addEventListener('click', () => {
-  if (!fbCurrentViewPath) return;
-  const token = STATE.authToken;
-  const url = `/api/files/download?path=${encodeURIComponent(fbCurrentViewPath)}`;
-  // Use fetch to add auth header, then trigger download
-  fetch(url, { headers: getAuthHeaders() })
-    .then(r => {
-      if (!r.ok) throw new Error('Download failed');
-      return r.blob();
-    })
-    .then(blob => {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = fbCurrentViewPath.split('/').pop();
-      a.click();
-      URL.revokeObjectURL(a.href);
-    })
-    .catch(err => alert('下载失败: ' + err.message));
-});
-
-// Delete from viewer
-$('#fvDelete').addEventListener('click', () => {
-  const path = fbCurrentViewPath;
-  if (path) deleteFile(path);
-});
-
-let fbCurrentViewPath = '';
-
-// Override viewFile to enable edit/delete
-const originalViewFile = viewFile;
-viewFile = async function(filePath, name) {
-  fbCurrentViewPath = filePath;
-  fvContent.style.display = '';
-  fvContentEdit.style.display = 'none';
-  await originalViewFile(filePath, name);
-};
-
-// Edit save (Ctrl+S or blur)
-fvContentEdit.addEventListener('keydown', async (e) => {
+fvContentEdit.addEventListener('keydown', async function(e) {
   if ((e.ctrlKey || e.metaKey) && e.key === 's') {
     e.preventDefault();
-    const newContent = fvContentEdit.value;
     try {
-      const res = await fetch('/api/files', {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ path: fbCurrentViewPath, content: newContent }),
-      });
-      if (!res.ok) throw new Error((await res.json()).detail || res.status);
-      fvContent.textContent = newContent;
-      fvContent.style.display = 'block';
+      const res = await fetch('/api/files', { method: 'POST', headers: getAuthHeaders(), body: JSON.stringify({ path: fbViewPath, content: fvContentEdit.value }) });
+      if (!res.ok) { const er = await res.json(); throw new Error(er.detail); }
+      fvContentEl.textContent = fvContentEdit.value;
+      fvContentEl.style.display = 'block';
       fvContentEdit.style.display = 'none';
-    } catch (err) {
-      alert('保存失败: ' + err.message);
-    }
+    } catch (err) { alert('保存失败: ' + err.message); }
   }
   if (e.key === 'Escape') {
-    fvContent.style.display = '';
+    fvContentEl.style.display = 'block';
     fvContentEdit.style.display = 'none';
   }
 });
 
-$('#filesBtn').addEventListener('click', () => {
-  fbHistory = [];
-  fbCurrentPath = '/opt/agent/workspace';
+/* ---------- download ---------- */
+
+$('#fvDownload').addEventListener('click', function() {
+  if (!fbViewPath) return;
+  fetch('/api/files/download?path=' + encodeURIComponent(fbViewPath), { headers: getAuthHeaders() })
+    .then(function(r) { if (!r.ok) throw new Error('fail'); return r.blob(); })
+    .then(function(blob) {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = fbViewPath.split('/').pop();
+      a.click();
+      URL.revokeObjectURL(a.href);
+    })
+    .catch(function() { alert('下载失败'); });
+});
+
+/* ---------- navigation ---------- */
+
+fbBack.addEventListener('click', function() {
+  if (fbHist.length) loadDir(fbHist.pop());
+});
+fbClose.addEventListener('click', showChat);
+fvBack.addEventListener('click', function() {
+  fileViewer.style.display = 'none';
+  fileBrowser.style.display = 'flex';
+  loadDir(fbDir);
+});
+fvClose.addEventListener('click', showChat);
+
+$('#filesBtn').addEventListener('click', function() {
+  fbHist = [];
+  fbDir = '/opt/agent/workspace';
   showFileBrowser();
   closeSidebar();
 });
