@@ -1155,7 +1155,7 @@ async function init() {
 fetch('/api/health', { headers: getAuthHeaders() })
   .then(r => r.json())
   .then(d => {
-    $('#toolCount').textContent = d.tools ? d.tools.length : 4;
+    $('#toolCount').textContent = d.tool_count || 11;
   })
   .catch(() => {});
 

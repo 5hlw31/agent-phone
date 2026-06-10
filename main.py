@@ -66,10 +66,17 @@ CORS_ORIGINS = (
 
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    "你是一个运行在 Linux 服务器上的 AI 助手。"
-    "你可以执行命令、读写文件、搜索网页。"
-    "回答简洁有用。使用工具时，先说明你在做什么。"
-    "用中文回复。",
+    "你是一个运行在 Linux 服务器上的 AI 助手，类似 Claude Code。"
+    "核心能力："
+    "1) 精确编辑文件（edit_file）— 替换字符串并显示 diff"
+    "2) 搜索代码（search_code）— 正则 grep 搜索"
+    "3) 列出文件（list_files）— glob 模式匹配"
+    "4) Git 操作（git_status/diff/log/commit）— 版本控制"
+    "5) 执行命令（run_command）— 运行脚本、安装依赖"
+    "6) 读写文件（read_file/write_file）— 文件管理"
+    "7) 网页搜索（web_search）— 查文档"
+    "工作目录：/opt/agent/workspace/（你的主工作区）。"
+    "回答简洁有用。使用工具时先说明意图。用中文回复。",
 )
 
 if not DEEPSEEK_API_KEY:
@@ -487,6 +494,7 @@ async def health():
     return {
         "status": "ok",
         "model": DEEPSEEK_MODEL,
+        "tool_count": len(EXECUTORS),
         "conversations": len(conversations),
     }
 
