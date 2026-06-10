@@ -412,6 +412,47 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_pptx",
+            "description": (
+                "创建 PowerPoint 演示文稿（.pptx），保存到 workspace。"
+                "支持标题页、目录、正文、两栏、结束页等布局。"
+                "支持代码块、粗体/斜体标记。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "输出文件名（例如 'presentation.pptx'），保存到 workspace。",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "演示文稿主标题。",
+                    },
+                    "subtitle": {
+                        "type": "string",
+                        "description": "副标题/作者（可选）。",
+                    },
+                    "slides": {
+                        "type": "array",
+                        "description": "幻灯片数组。每项含 title(标题), content(内容/要点，用\\n分隔), layout(title|bullets|text|two_column|quote|end)。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string", "description": "幻灯片标题。"},
+                                "content": {"type": "string", "description": "内容文本，用 \\n 分行，支持 **粗体** 和 *斜体*。"},
+                                "layout": {"type": "string", "description": "布局：title(封面) | toc(目录) | bullets(要点) | text(正文) | two_column(两栏，用 ==== 分左右) | quote(引用) | end(结束页)。"},
+                            },
+                        },
+                    },
+                },
+                "required": ["filename", "title", "slides"],
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -782,6 +823,216 @@ async def _run_git(args: list[str]) -> str:
         return f"[ERROR] {exc}"
 
 
+async def _create_pptx(filename: str, title: str, slides: list[dict], subtitle: str = "") -> str:
+    """Generate a .pptx file with structured slides."""
+
+    # Validate filename
+    if not filename.endswith(".pptx"):
+        filename += ".pptx"
+    # Only allow safe characters
+    safe_name = re.sub(r"[^\w\-.]", "_", filename)
+    output_path = f"/opt/agent/workspace/{safe_name}"
+
+    try:
+        from pptx import Presentation
+        from pptx.util import Inches, Pt, Emu
+        from pptx.dml.color import RGBColor
+        from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+    except ImportError:
+        return "[ERROR] python-pptx not installed. Run: pip install python-pptx"
+
+    prs = Presentation()
+    prs.slide_width = Inches(13.333)
+    prs.slide_height = Inches(7.5)
+
+    # ---------- color scheme ----------
+    BG_DARK   = RGBColor(0x0D, 0x11, 0x17)
+    ACCENT    = RGBColor(0x58, 0xA6, 0xFF)
+    WHITE     = RGBColor(0xFF, 0xFF, 0xFF)
+    DIM       = RGBColor(0x8B, 0x94, 0x9E)
+    GREEN     = RGBColor(0x3F, 0xB9, 0x50)
+
+    def set_slide_bg(slide, color):
+        bg = slide.background
+        fill = bg.fill
+        fill.solid()
+        fill.fore_color.rgb = color
+
+    def add_textbox(slide, left, top, width, height, text, font_size=18, bold=False, color=WHITE, alignment=PP_ALIGN.LEFT, font_name="Arial"):
+        txBox = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+        tf = txBox.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.text = text
+        p.font.size = Pt(font_size)
+        p.font.bold = bold
+        p.font.color.rgb = color
+        p.font.name = font_name
+        p.alignment = alignment
+        return tf
+
+    def add_rich_textbox(slide, left, top, width, height, content, font_size=16, color=WHITE):
+        """Add a textbox with simple markdown-like formatting (**bold**, *italic*, `code`)."""
+        txBox = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
+        tf = txBox.text_frame
+        tf.word_wrap = True
+        tf.clear()
+
+        lines = content.split("\n")
+        for i, line in enumerate(lines):
+            if i > 0:
+                p = tf.add_paragraph()
+            else:
+                p = tf.paragraphs[0]
+
+            p.space_after = Pt(6)
+            p.alignment = PP_ALIGN.LEFT
+
+            # Parse inline formatting: **bold**, *italic*, `code`
+            parts = re.split(r"(\*\*.*?\*\*|\*.*?\*|`.*?`)", line)
+            for part in parts:
+                if part.startswith("**") and part.endswith("**"):
+                    run = p.add_run()
+                    run.text = part[2:-2]
+                    run.font.bold = True
+                    run.font.size = Pt(font_size)
+                    run.font.color.rgb = color
+                    run.font.name = "Arial"
+                elif part.startswith("*") and part.endswith("*") and not part.startswith("**"):
+                    run = p.add_run()
+                    run.text = part[1:-1]
+                    run.font.italic = True
+                    run.font.size = Pt(font_size)
+                    run.font.color.rgb = color
+                    run.font.name = "Arial"
+                elif part.startswith("`") and part.endswith("`"):
+                    run = p.add_run()
+                    run.text = part[1:-1]
+                    run.font.size = Pt(font_size - 1)
+                    run.font.color.rgb = GREEN
+                    run.font.name = "Consolas"
+                elif part:
+                    run = p.add_run()
+                    run.text = part
+                    run.font.size = Pt(font_size)
+                    run.font.color.rgb = color
+                    run.font.name = "Arial"
+
+        return tf
+
+    # ---------- slide builders ----------
+    def slide_title():
+        sl = prs.slides.add_slide(prs.slide_layouts[6])  # blank
+        set_slide_bg(sl, BG_DARK)
+        # accent line
+        line = sl.shapes.add_shape(1, Inches(1.5), Inches(2.8), Inches(2), Pt(4))  # rectangle
+        line.fill.solid()
+        line.fill.fore_color.rgb = ACCENT
+        line.line.fill.background()
+        add_textbox(sl, 1.5, 3.0, 10.3, 1.5, title, font_size=44, bold=True, color=WHITE)
+        if subtitle:
+            add_textbox(sl, 1.5, 4.3, 10.3, 0.6, subtitle, font_size=20, color=DIM)
+        add_textbox(sl, 1.5, 6.6, 5, 0.4, "Agent 制作", font_size=12, color=DIM)
+
+    def slide_toc():
+        sl = prs.slides.add_slide(prs.slide_layouts[6])
+        set_slide_bg(sl, BG_DARK)
+        add_textbox(sl, 1.5, 0.6, 10, 0.6, "目录", font_size=32, bold=True, color=WHITE)
+        add_textbox(sl, 1.5, 1.3, 2, 0.3, "─" * 15, font_size=14, color=ACCENT)
+        # extract slide titles
+        items = [s.get("title", "") for s in slides if s.get("layout") not in ("title", "toc", "end")]
+        y = 1.8
+        for i, item in enumerate(items, 1):
+            add_textbox(sl, 2.0, y, 9, 0.5, f"{i:02d}  {item}", font_size=20, color=DIM if i % 2 == 0 else WHITE)
+            y += 0.5
+        add_textbox(sl, 1.5, 6.6, 5, 0.4, "Agent 制作", font_size=12, color=DIM)
+
+    def slide_bullets(s):
+        sl = prs.slides.add_slide(prs.slide_layouts[6])
+        set_slide_bg(sl, BG_DARK)
+        add_textbox(sl, 1.5, 0.6, 10, 0.6, s.get("title", ""), font_size=32, bold=True, color=WHITE)
+        add_textbox(sl, 1.5, 1.3, 2, 0.3, "─" * 15, font_size=14, color=ACCENT)
+        # bullet points
+        content = s.get("content", "")
+        bullets = [b.strip() for b in content.split("\n") if b.strip()]
+        y = 1.8
+        for b in bullets:
+            add_rich_textbox(sl, 2.0, y, 9.5, 0.6, b, font_size=18)
+            y += 0.55
+
+    def slide_text(s):
+        sl = prs.slides.add_slide(prs.slide_layouts[6])
+        set_slide_bg(sl, BG_DARK)
+        add_textbox(sl, 1.5, 0.6, 10, 0.6, s.get("title", ""), font_size=32, bold=True, color=WHITE)
+        add_textbox(sl, 1.5, 1.3, 2, 0.3, "─" * 15, font_size=14, color=ACCENT)
+        add_rich_textbox(sl, 1.5, 1.8, 10.3, 4.8, s.get("content", ""), font_size=16)
+
+    def slide_two_column(s):
+        sl = prs.slides.add_slide(prs.slide_layouts[6])
+        set_slide_bg(sl, BG_DARK)
+        add_textbox(sl, 1.5, 0.6, 10, 0.6, s.get("title", ""), font_size=32, bold=True, color=WHITE)
+        add_textbox(sl, 1.5, 1.3, 2, 0.3, "─" * 15, font_size=14, color=ACCENT)
+        content = s.get("content", "")
+        parts = content.split("====", 1)
+        left_text = parts[0].strip() if len(parts) > 0 else ""
+        right_text = parts[1].strip() if len(parts) > 1 else ""
+        # vertical divider
+        div = sl.shapes.add_shape(1, Inches(6.6), Inches(1.8), Pt(2), Inches(4.2))
+        div.fill.solid()
+        div.fill.fore_color.rgb = ACCENT
+        div.line.fill.background()
+        add_rich_textbox(sl, 1.5, 1.8, 4.8, 4.8, left_text, font_size=16)
+        add_rich_textbox(sl, 7.0, 1.8, 4.8, 4.8, right_text, font_size=16)
+
+    def slide_quote(s):
+        sl = prs.slides.add_slide(prs.slide_layouts[6])
+        set_slide_bg(sl, BG_DARK)
+        content = s.get("content", "").strip()
+        add_rich_textbox(sl, 2.5, 2.5, 8.3, 2.5, f"「{content}」", font_size=28, color=WHITE)
+        title = s.get("title", "").strip()
+        if title:
+            add_textbox(sl, 2.5, 5.0, 8.3, 0.5, f"— {title}", font_size=16, color=DIM)
+
+    def slide_end():
+        sl = prs.slides.add_slide(prs.slide_layouts[6])
+        set_slide_bg(sl, BG_DARK)
+        add_textbox(sl, 2, 3.0, 9, 1, "谢谢", font_size=52, bold=True, color=WHITE, alignment=PP_ALIGN.CENTER)
+        add_textbox(sl, 2, 4.2, 9, 0.6, "Agent 制作", font_size=16, color=DIM, alignment=PP_ALIGN.CENTER)
+
+    # ---------- render ----------
+    layout_map = {
+        "title": slide_title,
+        "toc": slide_toc,
+        "bullets": slide_bullets,
+        "text": slide_text,
+        "two_column": slide_two_column,
+        "quote": slide_quote,
+        "end": slide_end,
+    }
+
+    rendered_one_cover = False
+    for s in slides:
+        layout = s.get("layout", "bullets")
+        # auto-insert cover if first slide isn't title
+        if not rendered_one_cover and layout != "title":
+            slide_title()
+            rendered_one_cover = True
+        if layout == "title":
+            rendered_one_cover = True
+
+        builder = layout_map.get(layout, slide_bullets)
+        builder(s)
+
+    # always end with end slide
+    slide_end()
+
+    try:
+        prs.save(output_path)
+        return f"PPT 已保存: {output_path} ({len(slides) + 2} 页，含封面和结束页)"
+    except Exception as e:
+        return f"[ERROR] 保存失败: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -798,6 +1049,7 @@ EXECUTORS = {
     "git_diff": _git_diff,
     "git_log": _git_log,
     "git_commit": _git_commit,
+    "create_pptx": _create_pptx,
 }
 
 
