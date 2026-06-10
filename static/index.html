@@ -313,6 +313,48 @@ body {
 .empty-state .emoji { font-size: 3rem; margin-bottom: 8px; }
 
 /* ------------------------------------------------------------------ */
+/* Login page                                                         */
+/* ------------------------------------------------------------------ */
+.login-page {
+  display: none;
+  position: fixed; inset: 0;
+  background: var(--bg);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+}
+.login-page.show { display: flex; }
+.login-card {
+  width: 90%;
+  max-width: 320px;
+  text-align: center;
+}
+.login-emoji { font-size: 3rem; margin-bottom: 8px; }
+.login-card h2 { font-size: 1.25rem; margin-bottom: 4px; }
+.login-desc { color: var(--text-dim); font-size: 0.8125rem; margin-bottom: 20px; }
+.login-card input {
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.9375rem;
+  text-align: center;
+  outline: none;
+  margin-bottom: 10px;
+}
+.login-card input:focus { border-color: var(--accent); }
+.login-card .btn { margin-top: 4px; }
+.login-err {
+  color: var(--danger);
+  font-size: 0.75rem;
+  margin-top: 8px;
+  min-height: 18px;
+}
+
+/* ------------------------------------------------------------------ */
 /* Settings modal                                                     */
 /* ------------------------------------------------------------------ */
 .modal-overlay {
@@ -485,6 +527,18 @@ body {
 </style>
 </head>
 <body>
+
+<!-- Login page -->
+<div class="login-page" id="loginPage">
+  <div class="login-card">
+    <div class="login-emoji">🤖</div>
+    <h2>Agent 助手</h2>
+    <p class="login-desc">输入密码登录你的个人助手</p>
+    <input type="password" id="loginPw" placeholder="密码" autocomplete="current-password">
+    <button class="btn btn-accent" id="loginBtn">登录</button>
+    <div class="login-err" id="loginErr"></div>
+  </div>
+</div>
 
 <!-- Sidebar overlay (mobile) -->
 <div class="sidebar-overlay" id="sidebarOverlay"></div>
@@ -1320,16 +1374,128 @@ $('#filesBtn').addEventListener('click', function() {
 });
 
 /* ================================================================== */
+/* Login system                                                        */
+/* ================================================================== */
+const loginPage  = $('#loginPage');
+const loginPw    = $('#loginPw');
+const loginBtn   = $('#loginBtn');
+const loginErr   = $('#loginErr');
+
+function showLogin() {
+  loginPage.classList.add('show');
+  loginErr.textContent = '';
+  loginPw.focus();
+}
+
+function hideLogin() {
+  loginPage.classList.remove('show');
+}
+
+loginBtn.addEventListener('click', async () => {
+  const pw = loginPw.value.trim();
+  if (!pw) { loginErr.textContent = '请输入密码'; return; }
+  loginBtn.disabled = true;
+  loginErr.textContent = '';
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw }),
+    });
+    const data = await res.json();
+    if (!res.ok) { loginErr.textContent = data.detail || '密码错误'; loginBtn.disabled = false; return; }
+    saveToken(data.token);
+    updateGearIcon();
+    hideLogin();
+    loginPw.value = '';
+    await loadConversations();
+    if (STATE.conversations.length) {
+      await loadConversation(STATE.conversations[0].id);
+    }
+    userInput.focus();
+  } catch (err) {
+    loginErr.textContent = '网络错误，请重试';
+  }
+  loginBtn.disabled = false;
+});
+
+loginPw.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') loginBtn.click();
+});
+
+// Logout: clear token → back to login
+function logout() {
+  saveToken('');
+  updateGearIcon();
+  updateToolCount(0);
+  STATE.conversations = [];
+  STATE.activeId = null;
+  STATE.messages = [];
+  renderMessages();
+  renderConvList();
+  chatTitle.textContent = 'AI 助手';
+  showChat();
+  showLogin();
+}
+
+// Add logout to settings modal
+const settingsSaveOrig = $('#settingsSave').onclick;
+$('#settingsSave').addEventListener('click', function() {
+  // Original save handler runs first (via inline handler or separate listener)
+  // We add a logout note
+});
+
+// Add logout button to sidebar
+const logoutBtn = document.createElement('button');
+logoutBtn.className = 'btn';
+logoutBtn.textContent = '🚪 退出登录';
+logoutBtn.style.cssText = 'margin-top:6px;';
+logoutBtn.addEventListener('click', logout);
+$('#sidebar .sidebar-header').appendChild(logoutBtn);
+
+/* ================================================================== */
 /* Init                                                                */
 /* ================================================================== */
 async function init() {
   loadToken();
   updateGearIcon();
+
+  // Check if login is required
+  try {
+    const res = await fetch('/api/auth/status');
+    const status = await res.json();
+
+    if (status.login_required) {
+      if (!STATE.authToken) {
+        // No token → show login
+        showLogin();
+        return;
+      }
+      // Verify token is still valid
+      const checkRes = await fetch('/api/auth/check', { headers: getAuthHeaders() });
+      const check = await checkRes.json();
+      if (!check.logged_in) {
+        saveToken('');
+        showLogin();
+        return;
+      }
+    }
+  } catch (err) {
+    // Server unreachable — still try to load
+  }
+
+  // Logged in or auth not required
+  hideLogin();
   await loadConversations();
   if (STATE.conversations.length) {
     await loadConversation(STATE.conversations[0].id);
   }
   userInput.focus();
+}
+
+function updateToolCount(n) {
+  const el = $('#toolCount');
+  if (el) el.textContent = n;
 }
 
 // check health

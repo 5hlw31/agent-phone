@@ -54,9 +54,19 @@ MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "4096"))
 MAX_CONVERSATIONS = int(os.getenv("MAX_CONVERSATIONS", "100"))
 MAX_MESSAGES_PER_CONV = int(os.getenv("MAX_MESSAGES_PER_CONV", "500"))
 
-# Optional pre-shared token for authentication (MVP — single-user).
-# If set, clients must include `Authorization: Bearer <token>`.
+# Auth: password login → returns AUTH_TOKEN.
+# Set LOGIN_PASSWORD to enable login page. Leave empty for no-auth dev mode.
+LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "").strip()
 AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
+
+# If LOGIN_PASSWORD is set but no AUTH_TOKEN, generate one
+if LOGIN_PASSWORD and not AUTH_TOKEN:
+    import secrets
+    AUTH_TOKEN = secrets.token_urlsafe(32)
+    logger.warning("Generated AUTH_TOKEN=%s — save this or set in .env to persist across restarts", AUTH_TOKEN)
+
+# Auth required if either LOGIN_PASSWORD or AUTH_TOKEN is set
+AUTH_REQUIRED = bool(LOGIN_PASSWORD or AUTH_TOKEN)
 
 # CORS origins — restrict in production, allow all in dev.
 CORS_ORIGINS_RAW = os.getenv("CORS_ORIGINS", "")
@@ -95,15 +105,15 @@ client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 # ---------------------------------------------------------------------------
 
 async def _verify_auth(request: Request) -> None:
-    """If AUTH_TOKEN is configured, require a matching Bearer token."""
-    if not AUTH_TOKEN:
-        return  # auth disabled — single-user dev mode
+    """Require Bearer token if auth is enabled."""
+    if not AUTH_REQUIRED:
+        return
 
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     token = auth_header[7:]
-    if token != AUTH_TOKEN:
+    if not AUTH_TOKEN or token != AUTH_TOKEN:
         raise HTTPException(status_code=403, detail="Invalid token")
 
 
@@ -673,6 +683,57 @@ async def health():
 
 # ---------------------------------------------------------------------------
 # Entrypoint
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Auth routes (login system)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/auth/login")
+async def login(request: Request):
+    """
+    Login with password, returns the AUTH_TOKEN.
+    Request: { "password": "..." }
+    Response: { "token": "...", "ok": true }
+    """
+    if not LOGIN_PASSWORD:
+        raise HTTPException(status_code=400, detail="Login not configured — set LOGIN_PASSWORD in .env")
+
+    body = await request.json()
+    pw = (body.get("password") or "").strip()
+    if not pw:
+        raise HTTPException(status_code=400, detail="Password is required")
+
+    if pw != LOGIN_PASSWORD:
+        raise HTTPException(status_code=403, detail="Wrong password")
+
+    return {"ok": True, "token": AUTH_TOKEN}
+
+
+@app.get("/api/auth/check")
+async def check_auth(request: Request):
+    """
+    Check if the current request has a valid token.
+    Also returns whether login is required.
+    """
+    try:
+        await _verify_auth(request)
+        return {"ok": True, "auth_required": AUTH_REQUIRED, "logged_in": True}
+    except HTTPException:
+        return {"ok": True, "auth_required": AUTH_REQUIRED, "logged_in": False}
+
+
+@app.get("/api/auth/status")
+async def auth_status():
+    """Public: check if auth is required (no token needed)."""
+    return {
+        "login_required": bool(LOGIN_PASSWORD),
+        "auth_required": AUTH_REQUIRED,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Init
 # ---------------------------------------------------------------------------
 
 # Initialize DB on import
