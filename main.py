@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -119,19 +121,72 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# In-memory conversation store  (MVP — lost on restart)
+# ---------------------------------------------------------------------------
+# SQLite conversation store (persistent)
 # ---------------------------------------------------------------------------
 
-conversations: dict[str, dict[str, Any]] = {}
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "agent.db")
+_db_lock = threading.Lock()
 
-def _new_conversation(title: str = "") -> dict[str, Any]:
-    # Evict oldest if at capacity
-    if len(conversations) >= MAX_CONVERSATIONS:
-        oldest = min(
-            conversations.items(),
-            key=lambda kv: kv[1].get("updated_at", ""),
+def _get_db() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+def _init_db() -> None:
+    with _db_lock:
+        db = _get_db()
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '新对话',
+                messages TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        db.commit()
+        db.close()
+
+def _load_conv(conv_id: str) -> dict | None:
+    with _db_lock:
+        db = _get_db()
+        row = db.execute("SELECT * FROM conversations WHERE id=?", (conv_id,)).fetchone()
+        db.close()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "messages": json.loads(row["messages"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+def _save_conv(conv: dict) -> None:
+    with _db_lock:
+        db = _get_db()
+        db.execute(
+            "INSERT OR REPLACE INTO conversations (id, title, messages, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (conv["id"], conv["title"], json.dumps(conv["messages"], ensure_ascii=False),
+             conv["created_at"], conv["updated_at"]),
         )
-        del conversations[oldest[0]]
+        db.commit()
+        db.close()
+
+def _new_conversation(title: str = "") -> dict:
+    # Evict oldest if at capacity
+    with _db_lock:
+        db = _get_db()
+        count = db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+        if count >= MAX_CONVERSATIONS:
+            db.execute(
+                "DELETE FROM conversations WHERE id IN (SELECT id FROM conversations ORDER BY updated_at ASC LIMIT 1)"
+            )
+            db.commit()
+        db.close()
 
     conv = {
         "id": uuid.uuid4().hex,
@@ -140,19 +195,37 @@ def _new_conversation(title: str = "") -> dict[str, Any]:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    conversations[conv["id"]] = conv
+    _save_conv(conv)
     return conv
 
+def _delete_conv(conv_id: str) -> None:
+    with _db_lock:
+        db = _get_db()
+        db.execute("DELETE FROM conversations WHERE id=?", (conv_id,))
+        db.commit()
+        db.close()
 
-def _enforce_message_limit(conv: dict[str, Any]) -> None:
-    """Trim oldest non-system messages if over the limit."""
+def _list_convs() -> list[dict]:
+    with _db_lock:
+        db = _get_db()
+        rows = db.execute("SELECT id, title, created_at, updated_at, messages FROM conversations ORDER BY updated_at DESC").fetchall()
+        db.close()
+    return [
+        {
+            "id": r["id"], "title": r["title"],
+            "created_at": r["created_at"], "updated_at": r["updated_at"],
+            "message_count": len([m for m in json.loads(r["messages"]) if m["role"] != "system"]),
+        }
+        for r in rows
+    ]
+
+def _enforce_message_limit(conv: dict) -> None:
     messages = conv["messages"]
-    cutoff = MAX_MESSAGES_PER_CONV + 1  # +1 for system prompt
+    cutoff = MAX_MESSAGES_PER_CONV + 1
     if len(messages) > cutoff:
         system = [m for m in messages if m["role"] == "system"]
         rest = [m for m in messages if m["role"] != "system"]
-        excess = len(rest) - MAX_MESSAGES_PER_CONV
-        conv["messages"] = system + rest[excess:]
+        conv["messages"] = system + rest[cutoff - 1:]
 
 
 # ---------------------------------------------------------------------------
@@ -325,9 +398,8 @@ async def chat_send(request: Request, _auth=Depends(_verify_auth)):
         raise HTTPException(status_code=413, detail=f"Message too long (max {MAX_INPUT_LENGTH} chars)")
 
     # load or create conversation
-    if conv_id and conv_id in conversations:
-        conv = conversations[conv_id]
-    else:
+    conv = _load_conv(conv_id) if conv_id else None
+    if conv is None:
         title = user_message[:60].replace("\n", " ")
         conv = _new_conversation(title)
         conv_id = conv["id"]
@@ -341,6 +413,8 @@ async def chat_send(request: Request, _auth=Depends(_verify_auth)):
         try:
             async for sse_event in _agent_loop(conv["messages"]):
                 yield sse_event
+            conv["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _save_conv(conv)
             yield f"event: done\ndata: {json.dumps({'conversation_id': conv_id})}\n\n"
         except Exception:
             logger.exception("Agent loop failed for conversation %s", conv_id)
@@ -363,17 +437,7 @@ async def chat_send(request: Request, _auth=Depends(_verify_auth)):
 @app.get("/api/conversations")
 async def list_conversations(_auth=Depends(_verify_auth)):
     """Return all conversations (most recent first)."""
-    result = []
-    for c in conversations.values():
-        result.append({
-            "id": c["id"],
-            "title": c["title"],
-            "created_at": c["created_at"],
-            "updated_at": c["updated_at"],
-            "message_count": len([m for m in c["messages"] if m["role"] != "system"]),
-        })
-    result.sort(key=lambda x: x["updated_at"], reverse=True)
-    return {"conversations": result}
+    return {"conversations": _list_convs()}
 
 
 @app.post("/api/conversations")
@@ -390,7 +454,7 @@ async def create_conversation(request: Request, _auth=Depends(_verify_auth)):
 @app.get("/api/conversations/{conv_id}")
 async def get_conversation(conv_id: str, _auth=Depends(_verify_auth)):
     """Return a conversation with all messages."""
-    conv = conversations.get(conv_id)
+    conv = _load_conv(conv_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
     display_msgs = [m for m in conv["messages"] if m["role"] != "system"]
@@ -406,9 +470,9 @@ async def get_conversation(conv_id: str, _auth=Depends(_verify_auth)):
 @app.delete("/api/conversations/{conv_id}")
 async def delete_conversation(conv_id: str, _auth=Depends(_verify_auth)):
     """Delete a conversation."""
-    if conv_id not in conversations:
+    if not _load_conv(conv_id):
         raise HTTPException(status_code=404, detail="Conversation not found")
-    del conversations[conv_id]
+    _delete_conv(conv_id)
     return {"ok": True}
 
 
@@ -603,13 +667,16 @@ async def health():
         "status": "ok",
         "model": DEEPSEEK_MODEL,
         "tool_count": len(EXECUTORS),
-        "conversations": len(conversations),
+        "conversations": len(_list_convs()),
     }
 
 
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
+
+# Initialize DB on import
+_init_db()
 
 if __name__ == "__main__":
     import uvicorn

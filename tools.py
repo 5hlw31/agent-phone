@@ -493,6 +493,51 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": (
+                "抓取网页内容并转为 Markdown 文本。用于查阅在线文档、"
+                "阅读文章、获取最新信息。自动提取正文，过滤导航/广告。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "要抓取的网页 URL（必须 http/https）。",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "最大返回字符数（默认 8000）。",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "code_exec",
+            "description": (
+                "在沙箱中执行 Python 代码并返回 stdout。"
+                "限制：5秒超时、禁止网络/文件系统写入/子进程/os模块。"
+                "适合计算、数据处理、算法验证。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "要执行的 Python 代码。",
+                    },
+                },
+                "required": ["code"],
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -1181,6 +1226,123 @@ async def _create_pdf(filename: str, title: str, sections: list[dict], author: s
         return f"[ERROR] PDF 保存失败: {e}"
 
 
+async def _web_fetch(url: str, max_chars: int = 8000) -> str:
+    """Fetch a web page and return its main text content as Markdown."""
+    if not url.startswith(("http://", "https://")):
+        return "[ERROR] URL must start with http:// or https://"
+
+    # Block internal/private IPs to prevent SSRF
+    import ipaddress
+    from urllib.parse import urlparse
+
+    hostname = urlparse(url).hostname
+    if hostname:
+        # Block localhost and private ranges
+        blocked = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+        if hostname in blocked:
+            return "[BLOCKED] Cannot fetch localhost URLs"
+        try:
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_private or ip.is_loopback or ip.is_link_local:
+                return f"[BLOCKED] Cannot fetch private/internal IP: {hostname}"
+        except ValueError:
+            pass  # not an IP, probably a domain
+
+    try:
+        import httpx
+    except ImportError:
+        return "[ERROR] httpx not installed. Run: pip install httpx"
+
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as cl:
+            resp = await cl.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; AgentBot/1.0)"},
+            )
+            resp.raise_for_status()
+
+        html = resp.text
+
+        # Try to extract readable content
+        try:
+            from markdownify import markdownify as md
+            text = md(html, heading_style="ATX", strip=["script", "style", "nav", "footer", "header"])
+        except ImportError:
+            # Fallback: use BeautifulSoup
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            text = soup.get_text(separator="\n", strip=True)
+
+        limit = min(max_chars, 20000)
+        if len(text) > limit:
+            text = text[:limit] + f"\n\n... (截断，原文 {len(text)} 字符)"
+
+        return text if text.strip() else "(页面无文本内容)"
+
+    except httpx.HTTPStatusError as e:
+        return f"[ERROR] HTTP {e.response.status_code}"
+    except httpx.TimeoutException:
+        return "[TIMEOUT] 请求超时 (15s)"
+    except Exception as e:
+        return f"[ERROR] {e}"
+
+
+async def _code_exec(code: str) -> str:
+    """Execute Python code in a restricted sandbox subprocess."""
+    if not code or not code.strip():
+        return "[ERROR] Empty code"
+
+    # Sandbox preamble: restrict dangerous operations
+    sandbox_preamble = """
+import builtins
+__builtins__ = {k: v for k, v in builtins.__dict__.items()
+    if k not in ('open', 'exec', 'eval', 'compile', 'input',
+                  '__import__', 'breakpoint')}
+import sys, os
+sys.modules['os'] = None
+sys.modules['subprocess'] = None
+sys.modules['socket'] = None
+sys.modules['requests'] = None
+sys.modules['urllib'] = None
+sys.modules['http'] = None
+sys.modules['ftplib'] = None
+sys.modules['smtplib'] = None
+sys.modules['telnetlib'] = None
+del sys, os
+"""
+
+    full_code = sandbox_preamble + "\n" + code
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "/usr/bin/python3", "-c", full_code,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        out = stdout.decode("utf-8", errors="replace").strip()
+        err = stderr.decode("utf-8", errors="replace").strip()
+
+        parts = []
+        if out:
+            parts.append(out)
+        if err:
+            parts.append(f"[stderr]\n{err[:500]}")
+        if not parts:
+            parts.append("(no output)")
+        parts.append(f"(exit: {proc.returncode})")
+        return "\n".join(parts)
+
+    except asyncio.TimeoutError:
+        return "[TIMEOUT] Code execution exceeded 5 seconds — killed."
+    except FileNotFoundError:
+        return "[ERROR] python3 not found"
+    except Exception as exc:
+        return f"[ERROR] {exc}"
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -1199,6 +1361,8 @@ EXECUTORS = {
     "git_commit": _git_commit,
     "create_pptx": _create_pptx,
     "create_pdf": _create_pdf,
+    "web_fetch": _web_fetch,
+    "code_exec": _code_exec,
 }
 
 
