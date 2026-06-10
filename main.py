@@ -26,7 +26,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
@@ -572,6 +572,29 @@ async def delete_file(request: Request, _auth=Depends(_verify_auth)):
         if resolved.is_dir():
             raise HTTPException(status_code=400, detail=f"Directory not empty (or error): {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/files/download")
+async def download_file(path: str = "", _auth=Depends(_verify_auth)):
+    """
+    Download a file from the workspace with proper Content-Disposition header.
+    """
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    try:
+        resolved = _in_allowed(path, ALLOWED_READ_PATHS)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Path not allowed")
+
+    if not resolved.is_file():
+        raise HTTPException(status_code=400, detail="Not a regular file")
+
+    return FileResponse(
+        path=str(resolved),
+        filename=resolved.name,
+        media_type="application/octet-stream",
+    )
 
 
 @app.get("/api/health")

@@ -552,6 +552,7 @@ body {
       <button class="fb-back" id="fvBack" title="返回">←</button>
       <span class="fb-path" id="fvName">file.txt</span>
       <button class="fb-action" id="fvEdit" title="编辑">✎</button>
+      <button class="fb-action" id="fvDownload" title="下载">⬇</button>
       <button class="fb-action" id="fvDelete" title="删除">🗑</button>
       <button class="fb-close" id="fvClose" title="关闭">✕</button>
     </div>
@@ -1067,6 +1068,7 @@ let fbCurrentPath = '/opt/agent/workspace';
 let fbHistory = [];
 
 function showChat() {
+  document.body.classList.remove('viewing-files');
   fileBrowser.style.display = 'none';
   fileViewer.style.display = 'none';
   messagesArea.style.display = '';
@@ -1074,10 +1076,11 @@ function showChat() {
 }
 
 function showFileBrowser() {
+  document.body.classList.add('viewing-files');
   messagesArea.style.display = 'none';
   inputArea.style.display = 'none';
   fileViewer.style.display = 'none';
-  fileBrowser.style.display = '';
+  fileBrowser.style.display = 'flex';
   loadDirectory(fbCurrentPath);
 }
 
@@ -1123,11 +1126,11 @@ async function loadDirectory(dirPath) {
         else if (/\.(html|css|svg)$/i.test(name)) icon = '🌐';
         else if (/\.(png|jpg|jpeg|gif|webp|ico)$/i.test(name)) icon = '🖼';
       }
-      const meta = e.is_dir ? '' : formatSize(e.size);
+      const meta = e.is_dir ? '目录' : formatSize(e.size);
       return `
         <div class="fb-item" data-name="${escapeHtml(name)}" data-is-dir="${e.is_dir}">
           <span class="fb-icon">${icon}</span>
-          <span class="fb-name">${escapeHtml(name)}</span>
+          <span class="fb-name">${escapeHtml(name)}${e.is_dir ? '/' : ''}</span>
           <span class="fb-meta">${meta}</span>
           <button class="fb-del" data-del="${escapeHtml(name)}" title="删除">×</button>
         </div>`;
@@ -1173,7 +1176,7 @@ async function viewFile(filePath, name) {
     fvName.textContent = name;
     fvContent.textContent = data.content || '(空文件)';
     fileBrowser.style.display = 'none';
-    fileViewer.style.display = '';
+    fileViewer.style.display = 'flex';
   } catch (err) {
     alert('读取失败: ' + err.message);
   }
@@ -1189,7 +1192,8 @@ fbClose.addEventListener('click', showChat);
 
 fvBack.addEventListener('click', () => {
   fileViewer.style.display = 'none';
-  fileBrowser.style.display = '';
+  fileBrowser.style.display = 'flex';
+  loadDirectory(fbCurrentPath);
 });
 
 fvClose.addEventListener('click', showChat);
@@ -1302,6 +1306,27 @@ $('#fvEdit').addEventListener('click', () => {
 });
 
 
+// Download from viewer
+$('#fvDownload').addEventListener('click', () => {
+  if (!fbCurrentViewPath) return;
+  const token = STATE.authToken;
+  const url = `/api/files/download?path=${encodeURIComponent(fbCurrentViewPath)}`;
+  // Use fetch to add auth header, then trigger download
+  fetch(url, { headers: getAuthHeaders() })
+    .then(r => {
+      if (!r.ok) throw new Error('Download failed');
+      return r.blob();
+    })
+    .then(blob => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = fbCurrentViewPath.split('/').pop();
+      a.click();
+      URL.revokeObjectURL(a.href);
+    })
+    .catch(err => alert('下载失败: ' + err.message));
+});
+
 // Delete from viewer
 $('#fvDelete').addEventListener('click', () => {
   const path = fbCurrentViewPath;
@@ -1332,7 +1357,7 @@ fvContentEdit.addEventListener('keydown', async (e) => {
       });
       if (!res.ok) throw new Error((await res.json()).detail || res.status);
       fvContent.textContent = newContent;
-      fvContent.style.display = '';
+      fvContent.style.display = 'block';
       fvContentEdit.style.display = 'none';
     } catch (err) {
       alert('保存失败: ' + err.message);
