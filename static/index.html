@@ -380,15 +380,17 @@ body {
   border-bottom: 1px solid var(--border);
   font-size: 0.8125rem;
 }
-.fb-header .fb-back, .fb-header .fb-close {
+.fb-header .fb-back, .fb-header .fb-close, .fb-header .fb-action {
   background: none;
   border: none;
   color: var(--text-dim);
   font-size: 1rem;
   cursor: pointer;
-  padding: 4px;
+  padding: 4px 6px;
+  border-radius: 4px;
 }
-.fb-header .fb-back:hover, .fb-header .fb-close:hover { color: var(--text); }
+.fb-header .fb-back:hover, .fb-header .fb-close:hover, .fb-header .fb-action:hover { color: var(--text); background: var(--border); }
+.fb-header .fb-action.danger:hover { color: var(--danger); }
 .fb-header .fb-path {
   flex: 1;
   color: var(--accent);
@@ -416,6 +418,32 @@ body {
 .fb-item .fb-icon { font-size: 1.1rem; flex-shrink: 0; }
 .fb-item .fb-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fb-item .fb-meta { color: var(--text-dim); font-size: 0.6875rem; flex-shrink: 0; }
+.fb-item .fb-del {
+  opacity: 0;
+  background: none;
+  border: none;
+  color: var(--danger);
+  font-size: 1rem;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.fb-item:hover .fb-del { opacity: 1; }
+.fb-item .fb-del:hover { background: var(--border); }
+.fv-content-edit {
+  flex: 1;
+  width: 100%;
+  padding: 14px;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--text);
+  border: none;
+  resize: none;
+  outline: none;
+}
 .fb-empty {
   text-align: center;
   color: var(--text-dim);
@@ -510,6 +538,9 @@ body {
     <div class="fb-header">
       <button class="fb-back" id="fbBack" title="返回">←</button>
       <span class="fb-path" id="fbPath">/workspace</span>
+      <button class="fb-action" id="fbCreate" title="新建">＋</button>
+      <button class="fb-action" id="fbUpload" title="上传">↑</button>
+      <input type="file" id="fbUploadInput" style="display:none" multiple>
       <button class="fb-close" id="fbClose" title="关闭">✕</button>
     </div>
     <div class="fb-list" id="fbList"></div>
@@ -520,9 +551,28 @@ body {
     <div class="fb-header">
       <button class="fb-back" id="fvBack" title="返回">←</button>
       <span class="fb-path" id="fvName">file.txt</span>
+      <button class="fb-action" id="fvEdit" title="编辑">✎</button>
+      <button class="fb-action" id="fvDelete" title="删除">🗑</button>
       <button class="fb-close" id="fvClose" title="关闭">✕</button>
     </div>
+    <textarea class="fv-content-edit" id="fvContentEdit" style="display:none;"></textarea>
     <pre class="fv-content" id="fvContent"></pre>
+  </div>
+
+  <!-- Create file modal -->
+  <div class="modal-overlay" id="createOverlay">
+    <div class="modal">
+      <h3 id="createTitle">新建文件</h3>
+      <label for="createName">文件名</label>
+      <input type="text" id="createName" placeholder="例如 notes.md 或 新建文件夹/">
+      <label for="createContent">内容（可选）</label>
+      <textarea id="createContent" rows="5" placeholder="文件内容…" style="width:100%;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-family:var(--font-mono);font-size:0.8125rem;resize:vertical;"></textarea>
+      <div class="btn-row">
+        <button class="btn" id="createCancel">取消</button>
+        <button class="btn btn-accent" id="createConfirm">创建</button>
+      </div>
+      <div class="status-msg" id="createStatus"></div>
+    </div>
   </div>
 
   <div class="input-area">
@@ -1079,12 +1129,15 @@ async function loadDirectory(dirPath) {
           <span class="fb-icon">${icon}</span>
           <span class="fb-name">${escapeHtml(name)}</span>
           <span class="fb-meta">${meta}</span>
+          <button class="fb-del" data-del="${escapeHtml(name)}" title="删除">×</button>
         </div>`;
     }).join('');
 
     // click handlers
     fbList.querySelectorAll('.fb-item').forEach(el => {
-      el.addEventListener('click', () => {
+      el.addEventListener('click', (e) => {
+        // ignore clicks on delete button
+        if (e.target.classList.contains('fb-del')) return;
         const name = el.dataset.name;
         const isDir = el.dataset.is_dir === 'true';
         const fullPath = dirPath + '/' + name;
@@ -1095,6 +1148,16 @@ async function loadDirectory(dirPath) {
           viewFile(fullPath, name);
         }
       });
+      // delete button
+      const delBtn = el.querySelector('.fb-del');
+      if (delBtn) {
+        delBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const name = el.dataset.name;
+          const fullPath = dirPath + '/' + name;
+          deleteFile(fullPath);
+        });
+      }
     });
   } catch (err) {
     fbList.innerHTML = `<div class="fb-empty">加载失败: ${escapeHtml(err.message)}</div>`;
@@ -1130,6 +1193,156 @@ fvBack.addEventListener('click', () => {
 });
 
 fvClose.addEventListener('click', showChat);
+
+/* --- File operations: create, delete, edit, upload --- */
+
+const createOverlay  = $('#createOverlay');
+const createName     = $('#createName');
+const createContent  = $('#createContent');
+const createStatus   = $('#createStatus');
+const createTitle    = $('#createTitle');
+const createConfirm  = $('#createConfirm');
+
+// Create modal
+$('#fbCreate').addEventListener('click', () => {
+  createTitle.textContent = '新建';
+  createName.value = '';
+  createContent.value = '';
+  createStatus.textContent = '';
+  createStatus.className = 'status-msg';
+  createOverlay.classList.add('show');
+  createName.focus();
+});
+
+createOverlay.addEventListener('click', (e) => {
+  if (e.target === createOverlay) createOverlay.classList.remove('show');
+});
+$('#createCancel').addEventListener('click', () => createOverlay.classList.remove('show'));
+
+createConfirm.addEventListener('click', async () => {
+  const name = createName.value.trim();
+  if (!name) { createStatus.textContent = '请输入文件名'; createStatus.className = 'status-msg err'; return; }
+
+  const content = createContent.value;
+  const basePath = fbCurrentPath;
+  // if relative, join with current browsing dir
+  let fullPath = name.startsWith('/') ? name : basePath + '/' + name;
+
+  try {
+    const res = await fetch('/api/files', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ path: fullPath, content }),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    createStatus.textContent = '✓ 已创建';
+    createStatus.className = 'status-msg ok';
+    setTimeout(() => createOverlay.classList.remove('show'), 600);
+    loadDirectory(fbCurrentPath);
+  } catch (err) {
+    createStatus.textContent = '失败: ' + err.message;
+    createStatus.className = 'status-msg err';
+  }
+});
+
+// Upload
+$('#fbUpload').addEventListener('click', () => {
+  $('#fbUploadInput').click();
+});
+
+$('#fbUploadInput').addEventListener('change', async () => {
+  const files = $('#fbUploadInput').files;
+  if (!files.length) return;
+
+  let uploaded = 0;
+  for (const file of files) {
+    const text = await file.text();
+    const fullPath = fbCurrentPath + '/' + file.name;
+    try {
+      const res = await fetch('/api/files', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ path: fullPath, content: text }),
+      });
+      if (res.ok) uploaded++;
+    } catch {}
+  }
+  $('#fbUploadInput').value = '';
+  loadDirectory(fbCurrentPath);
+});
+
+// Delete file (from file list)
+async function deleteFile(path) {
+  if (!confirm(`确定删除 ${path.split('/').pop()}？`)) return;
+  try {
+    const res = await fetch(`/api/files?path=${encodeURIComponent(path)}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      alert('删除失败: ' + (err.detail || res.status));
+    }
+    loadDirectory(fbCurrentPath);
+  } catch (err) {
+    alert('删除失败: ' + err.message);
+  }
+}
+
+// Edit file (from viewer)
+$('#fvEdit').addEventListener('click', () => {
+  const content = fvContent.textContent;
+  fvContent.style.display = 'none';
+  fvContentEdit.style.display = '';
+  fvContentEdit.value = content;
+  fvContentEdit.focus();
+});
+
+
+// Delete from viewer
+$('#fvDelete').addEventListener('click', () => {
+  const path = fbCurrentViewPath;
+  if (path) deleteFile(path);
+});
+
+let fbCurrentViewPath = '';
+
+// Override viewFile to enable edit/delete
+const originalViewFile = viewFile;
+viewFile = async function(filePath, name) {
+  fbCurrentViewPath = filePath;
+  fvContent.style.display = '';
+  fvContentEdit.style.display = 'none';
+  await originalViewFile(filePath, name);
+};
+
+// Edit save (Ctrl+S or blur)
+fvContentEdit.addEventListener('keydown', async (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+    e.preventDefault();
+    const newContent = fvContentEdit.value;
+    try {
+      const res = await fetch('/api/files', {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ path: fbCurrentViewPath, content: newContent }),
+      });
+      if (!res.ok) throw new Error((await res.json()).detail || res.status);
+      fvContent.textContent = newContent;
+      fvContent.style.display = '';
+      fvContentEdit.style.display = 'none';
+    } catch (err) {
+      alert('保存失败: ' + err.message);
+    }
+  }
+  if (e.key === 'Escape') {
+    fvContent.style.display = '';
+    fvContentEdit.style.display = 'none';
+  }
+});
 
 $('#filesBtn').addEventListener('click', () => {
   fbHistory = [];

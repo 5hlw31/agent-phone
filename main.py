@@ -489,6 +489,91 @@ async def browse_files(path: str = "", _auth=Depends(_verify_auth)):
     }
 
 
+@app.post("/api/files")
+async def create_file(request: Request, _auth=Depends(_verify_auth)):
+    """
+    Create or upload a new file in the workspace.
+
+    JSON body: { "path": "dir/filename.txt", "content": "file contents..." }
+    If path ends with /, it's treated as a new directory.
+    """
+    body = await request.json()
+    filepath = (body.get("path") or "").strip()
+    content = body.get("content", "")
+
+    if not filepath:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    # Resolve
+    if not filepath.startswith("/"):
+        filepath = f"/opt/agent/workspace/{filepath}"
+
+    try:
+        resolved = _in_allowed(filepath, ALLOWED_READ_PATHS)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Path not allowed")
+
+    # Check write permission
+    from tools import ALLOWED_WRITE_PATHS, _in_allowed as _write_check
+    try:
+        _write_check(filepath, ALLOWED_WRITE_PATHS)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Write not allowed in this path")
+
+    try:
+        if filepath.endswith("/") or body.get("is_dir"):
+            resolved.mkdir(parents=True, exist_ok=True)
+            return {"ok": True, "type": "dir", "path": str(resolved)}
+        else:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+            resolved.write_text(content, encoding="utf-8")
+            size = len(content.encode("utf-8"))
+            return {"ok": True, "type": "file", "path": str(resolved), "size": size}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/files")
+async def delete_file(request: Request, _auth=Depends(_verify_auth)):
+    """
+    Delete a file or empty directory in the workspace.
+
+    Query params:
+      path — absolute path to the file/directory to delete.
+    """
+    path = request.query_params.get("path", "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    try:
+        resolved = _in_allowed(path, ALLOWED_READ_PATHS)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Path not allowed")
+
+    # Extra guard: don't delete the workspace root or .git
+    if resolved.as_posix() in ("/opt/agent/workspace", "/opt/agent", "/opt"):
+        raise HTTPException(status_code=403, detail="Cannot delete root directory")
+    if ".git" in resolved.parts:
+        raise HTTPException(status_code=403, detail="Cannot delete .git directory")
+
+    from tools import ALLOWED_WRITE_PATHS, _in_allowed as _write_check
+    try:
+        _write_check(str(resolved), ALLOWED_WRITE_PATHS)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Write not allowed in this path")
+
+    try:
+        if resolved.is_dir():
+            resolved.rmdir()
+        else:
+            resolved.unlink()
+        return {"ok": True, "deleted": str(resolved)}
+    except OSError as e:
+        if resolved.is_dir():
+            raise HTTPException(status_code=400, detail=f"Directory not empty (or error): {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/health")
 async def health():
     return {
