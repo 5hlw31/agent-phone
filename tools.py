@@ -32,6 +32,7 @@ ALLOWED_READ_PATHS: list[str] = [
 
 # Directories where file write is permitted (subset of read paths)
 ALLOWED_WRITE_PATHS: list[str] = [
+    "/opt/agent/workspace",
     "/opt/agent/data",
     "/tmp",
 ]

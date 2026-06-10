@@ -30,7 +30,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
-from tools import EXECUTORS, TOOL_DEFINITIONS, execute_tool
+from tools import EXECUTORS, TOOL_DEFINITIONS, execute_tool, _in_allowed, ALLOWED_READ_PATHS, MAX_READ_BYTES
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -403,6 +403,83 @@ async def delete_conversation(conv_id: str, _auth=Depends(_verify_auth)):
         raise HTTPException(status_code=404, detail="Conversation not found")
     del conversations[conv_id]
     return {"ok": True}
+
+
+@app.get("/api/files")
+async def browse_files(path: str = "", _auth=Depends(_verify_auth)):
+    """
+    Browse the file workspace. Defaults to /opt/agent/workspace/.
+
+    Query params:
+      path  — relative path from workspace root, or absolute within allowed paths.
+
+    Returns JSON:
+      { type: "dir"|"file", name, path, entries?[], content? }
+    """
+    # Resolve the path
+    if not path:
+        target = "/opt/agent/workspace"
+    elif path.startswith("/"):
+        target = path
+    else:
+        target = f"/opt/agent/workspace/{path}"
+
+    try:
+        resolved = _in_allowed(target, ALLOWED_READ_PATHS)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Path not allowed")
+
+    import stat as stat_module
+
+    try:
+        st = resolved.stat()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Directory listing
+    if resolved.is_dir():
+        entries = []
+        try:
+            for entry in sorted(resolved.iterdir()):
+                try:
+                    es = entry.stat()
+                    entries.append({
+                        "name": entry.name,
+                        "is_dir": entry.is_dir(),
+                        "size": es.st_size if not entry.is_dir() else 0,
+                        "mtime": int(es.st_mtime),
+                    })
+                except OSError:
+                    pass
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="Permission denied")
+
+        return {
+            "type": "dir",
+            "name": resolved.name or resolved.as_posix(),
+            "path": str(resolved),
+            "entries": entries,
+        }
+
+    # File read
+    if not stat_module.S_ISREG(st.st_mode):
+        raise HTTPException(status_code=400, detail="Not a regular file")
+
+    if st.st_size > MAX_READ_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large (>{MAX_READ_BYTES} bytes)")
+
+    try:
+        content = resolved.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Cannot read as text")
+
+    return {
+        "type": "file",
+        "name": resolved.name,
+        "path": str(resolved),
+        "size": st.st_size,
+        "content": content,
+    }
 
 
 @app.get("/api/health")
