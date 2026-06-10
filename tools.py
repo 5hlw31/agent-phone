@@ -453,6 +453,46 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_pdf",
+            "description": (
+                "创建 PDF 文档（使用 fpdf2），保存到 workspace。"
+                "支持标题、正文、代码块、分页。支持中文字体。"
+                "适合生成报告、笔记、文档等。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "输出文件名（例如 'report.pdf'），保存到 workspace。",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "文档标题（显示在封面和页眉）。",
+                    },
+                    "author": {
+                        "type": "string",
+                        "description": "作者名（可选）。",
+                    },
+                    "sections": {
+                        "type": "array",
+                        "description": "章节数组。每项含 heading（标题）和 content（正文，支持 \\n 分段）。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "heading": {"type": "string", "description": "章节标题。"},
+                                "content": {"type": "string", "description": "正文内容，用 \\n 分段。支持 **粗体** 标记。"},
+                            },
+                        },
+                    },
+                },
+                "required": ["filename", "title", "sections"],
+            },
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -1033,6 +1073,114 @@ async def _create_pptx(filename: str, title: str, slides: list[dict], subtitle: 
         return f"[ERROR] 保存失败: {e}"
 
 
+async def _create_pdf(filename: str, title: str, sections: list[dict], author: str = "") -> str:
+    """Generate a PDF document with structured sections."""
+
+    if not filename.endswith(".pdf"):
+        filename += ".pdf"
+    safe_name = re.sub(r"[^\w\-.]", "_", filename)
+    output_path = f"/opt/agent/workspace/{safe_name}"
+
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        return "[ERROR] fpdf2 not installed. Run: pip install fpdf2"
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=20)
+
+    # ---------- helpers ----------
+    def add_page():
+        pdf.add_page()
+
+    def write_title(txt):
+        pdf.set_font("Helvetica", "B", 22)
+        pdf.multi_cell(0, 12, txt, align="C")
+        pdf.ln(4)
+
+    def write_heading(txt):
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 14)
+        # Underline with a line
+        y = pdf.get_y()
+        pdf.set_draw_color(88, 166, 255)  # accent blue
+        pdf.set_line_width(0.5)
+        pdf.line(20, y + 8, 190, y + 8)
+        pdf.multi_cell(0, 10, txt)
+        pdf.ln(2)
+
+    def write_body(txt):
+        pdf.set_font("Helvetica", "", 11)
+        # Parse **bold** markers
+        parts = re.split(r"(\*\*.*?\*\*)", txt)
+        for part in parts:
+            if part.startswith("**") and part.endswith("**"):
+                pdf.set_font("Helvetica", "B", 11)
+                pdf.write(5.5, part[2:-2])
+            else:
+                pdf.set_font("Helvetica", "", 11)
+                pdf.write(5.5, part)
+        pdf.ln(2)
+
+    def write_code(txt):
+        pdf.set_fill_color(240, 240, 245)
+        pdf.set_font("Courier", "", 9)
+        for line in txt.split("\n"):
+            pdf.set_x(25)
+            pdf.cell(160, 5, line, fill=True)
+            pdf.ln()
+
+    # ---------- render ----------
+    # Cover
+    add_page()
+    pdf.ln(30)
+    write_title(title)
+    if author:
+        pdf.set_font("Helvetica", "", 12)
+        pdf.cell(0, 10, author, align="C")
+        pdf.ln(14)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(139, 148, 158)
+    pdf.cell(0, 10, f"Agent 生成  |  {len(sections)} 个章节", align="C")
+
+    # Sections
+    for sec in sections:
+        add_page()
+        h = sec.get("heading", "")
+        c = sec.get("content", "")
+        write_heading(h)
+        pdf.ln(4)
+
+        # Split content into paragraphs
+        paragraphs = c.split("\n")
+        in_code = False
+        code_buf = []
+        for para in paragraphs:
+            stripped = para.strip()
+            if stripped.startswith("```"):
+                if in_code:
+                    write_code("\n".join(code_buf))
+                    code_buf = []
+                    in_code = False
+                else:
+                    in_code = True
+            elif in_code:
+                code_buf.append(para)
+            elif stripped:
+                write_body(stripped)
+            else:
+                pdf.ln(4)  # blank line = paragraph break
+
+        if in_code and code_buf:
+            write_code("\n".join(code_buf))
+
+    try:
+        pdf.output(output_path)
+        return f"PDF 已保存: {output_path} ({pdf.pages_count} 页)"
+    except Exception as e:
+        return f"[ERROR] PDF 保存失败: {e}"
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -1050,6 +1198,7 @@ EXECUTORS = {
     "git_log": _git_log,
     "git_commit": _git_commit,
     "create_pptx": _create_pptx,
+    "create_pdf": _create_pdf,
 }
 
 
