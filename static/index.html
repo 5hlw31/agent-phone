@@ -744,17 +744,18 @@ function createMsgEl(role, content) {
 
 function createToolCard(callId, toolName, args, result) {
   const el = document.createElement('div');
+  const safeResult = String(result || '');
 
   // web_search: render results cleanly, no parameter dump
   if (toolName === 'web_search') {
     el.className = 'msg assistant';
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
-    const status = result.startsWith('[ERROR') || result.startsWith('[TIMEOUT')
+    const status = safeResult.startsWith('[ERROR') || safeResult.startsWith('[TIMEOUT')
       ? '🔍 搜索失败'
       : '🔍 搜索结果';
     bubble.innerHTML = `<div style="font-weight:600;margin-bottom:6px;color:var(--text-dim);font-size:0.75rem;">${status}</div>`
-      + renderMarkdown(result.replace(/\[ERROR\]\s*/g, '').replace(/\[TIMEOUT\]\s*/g, ''));
+      + renderMarkdown(safeResult.replace(/\[ERROR\]\s*/g, '').replace(/\[TIMEOUT\]\s*/g, ''));
     el.appendChild(bubble);
     el.id = `tool-${callId}`;
     return el;
@@ -763,7 +764,7 @@ function createToolCard(callId, toolName, args, result) {
   // other tools: compact card without collapse/expand
   el.className = 'tool-card';
   el.id = `tool-${callId}`;
-  const statusClass = result.startsWith('[ERROR') || result.startsWith('[BLOCKED') || result.startsWith('[TIMEOUT')
+  const statusClass = safeResult.startsWith('[ERROR') || safeResult.startsWith('[BLOCKED') || safeResult.startsWith('[TIMEOUT')
     ? 'err' : 'ok';
   const iconMap = {
     run_command: '💻', read_file: '📖', write_file: '✏️', edit_file: '✂️',
@@ -772,7 +773,7 @@ function createToolCard(callId, toolName, args, result) {
     web_search: '🌐', web_fetch: '🌍', code_exec: '🐍',
   };
   const statusText = statusClass === 'ok' ? '✓' : '✗';
-  const shortResult = String(result).slice(0, 500);
+  const shortResult = safeResult.slice(0, 500);
   el.innerHTML = `
     <div class="tool-header">
       <span class="icon">${iconMap[toolName] || '🔧'}</span>
@@ -871,7 +872,16 @@ async function loadConversation(id) {
   if (!res.ok) return;
   const data = await res.json();
   STATE.activeId = data.id;
-  STATE.messages = data.messages.map(m => ({...m, _type: m.role === 'tool' ? 'tool' : null}));
+  STATE.messages = data.messages.map(m => {
+    const msg = {...m, _type: m.role === 'tool' ? 'tool' : null};
+    if (msg._type === 'tool') {
+      msg.result = m.content;       // server stores tool result in 'content'
+      msg.tool_name = m.tool_name || '';
+      msg.arguments = m.arguments || {};
+      msg.call_id = m.call_id || m.tool_call_id;
+    }
+    return msg;
+  });
   chatTitle.textContent = data.title;
   renderMessages();
   renderConvList();
