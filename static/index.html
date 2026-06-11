@@ -217,15 +217,9 @@ body {
   align-items: center;
   gap: 6px;
   margin-bottom: 6px;
-  cursor: pointer;
-  user-select: none;
 }
 .tool-card .tool-header .icon { font-size: 1rem; }
 .tool-card .tool-header .name { color: var(--accent); font-weight: 600; }
-.tool-card .tool-header .arrow { color: var(--text-dim); font-size: 0.75rem; transition: transform 0.15s; }
-.tool-card.open .tool-header .arrow { transform: rotate(90deg); }
-.tool-card .tool-detail { display: none; }
-.tool-card.open .tool-detail { display: block; }
 .tool-card .tool-detail pre {
   background: var(--bg);
   border-radius: 6px;
@@ -233,14 +227,15 @@ body {
   font-family: var(--font-mono);
   font-size: 0.75rem;
   overflow-x: auto;
-  max-height: 200px;
+  max-height: 150px;
   overflow-y: auto;
-  margin-top: 4px;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 .tool-card .tool-status {
   font-size: 0.6875rem;
-  padding: 2px 6px;
-  border-radius: 4px;
+  margin-left: auto;
 }
 .tool-card .tool-status.ok { color: var(--accent2); }
 .tool-card .tool-status.err { color: var(--danger); }
@@ -749,20 +744,42 @@ function createMsgEl(role, content) {
 
 function createToolCard(callId, toolName, args, result) {
   const el = document.createElement('div');
-  el.className = 'tool-card open';
+
+  // web_search: render results cleanly, no parameter dump
+  if (toolName === 'web_search') {
+    el.className = 'msg assistant';
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    const status = result.startsWith('[ERROR') || result.startsWith('[TIMEOUT')
+      ? '🔍 搜索失败'
+      : '🔍 搜索结果';
+    bubble.innerHTML = `<div style="font-weight:600;margin-bottom:6px;color:var(--text-dim);font-size:0.75rem;">${status}</div>`
+      + renderMarkdown(result.replace(/\[ERROR\]\s*/g, '').replace(/\[TIMEOUT\]\s*/g, ''));
+    el.appendChild(bubble);
+    el.id = `tool-${callId}`;
+    return el;
+  }
+
+  // other tools: compact card without collapse/expand
+  el.className = 'tool-card';
   el.id = `tool-${callId}`;
+  const statusClass = result.startsWith('[ERROR') || result.startsWith('[BLOCKED') || result.startsWith('[TIMEOUT')
+    ? 'err' : 'ok';
+  const iconMap = {
+    run_command: '💻', read_file: '📖', write_file: '✏️', edit_file: '✂️',
+    search_code: '🔎', list_files: '📂', git_status: '📋', git_diff: '📊',
+    git_log: '📜', git_commit: '✅', create_pptx: '📊', create_pdf: '📄',
+    web_search: '🌐', web_fetch: '🌍', code_exec: '🐍',
+  };
+  const statusText = statusClass === 'ok' ? '✓' : '✗';
+  const shortResult = String(result).slice(0, 500);
   el.innerHTML = `
-    <div class="tool-header" onclick="this.parentElement.classList.toggle('open')">
-      <span class="icon">🔧</span>
+    <div class="tool-header">
+      <span class="icon">${iconMap[toolName] || '🔧'}</span>
       <span class="name">${escapeHtml(toolName)}</span>
-      <span class="arrow">▶</span>
+      <span class="tool-status ${statusClass}">${statusText}</span>
     </div>
-    <div class="tool-detail">
-      <div style="color:var(--text-dim);margin-bottom:4px;">参数：</div>
-      <pre>${escapeHtml(JSON.stringify(args, null, 2))}</pre>
-      <div style="color:var(--text-dim);margin:8px 0 4px;">结果：</div>
-      <pre class="tool-result">${escapeHtml(String(result).slice(0, 2000))}</pre>
-    </div>`;
+    <div class="tool-detail"><pre>${escapeHtml(shortResult)}</pre></div>`;
   return el;
 }
 
@@ -1011,18 +1028,23 @@ async function sendMessage(text) {
             scrollBottom();
             break;
 
-          case 'tool_result':
-            // match tool card by call_id
+          case 'tool_result': {
             const cardId = data.call_id || data.tool_name;
             const card = document.getElementById(`tool-${cardId}`);
-            if (card) {
-              const resultPre = card.querySelector('.tool-result');
+            if (!card) break;
+            // web_search: replace entire card with rendered result
+            if (data.tool_name === 'web_search') {
+              const newCard = createToolCard(cardId, data.tool_name, {}, data.result);
+              card.replaceWith(newCard);
+            } else {
+              const resultPre = card.querySelector('.tool-detail pre');
               if (resultPre) {
-                resultPre.textContent = String(data.result || '(empty)').slice(0, 2000);
+                resultPre.textContent = String(data.result || '(empty)').slice(0, 500);
               }
             }
             scrollBottom();
             break;
+          }
 
           case 'error':
             removeTyping();
