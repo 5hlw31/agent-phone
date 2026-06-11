@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>AI 助手</title>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
@@ -843,15 +846,19 @@ function renderMessages() {
   }
   for (let i = 0; i < STATE.messages.length; i++) {
     const msg = STATE.messages[i];
-    if (msg._type === 'tool') {
-      messagesEl.appendChild(createToolCard(
-        msg.call_id || `${msg.tool_name}_${i}`,
-        msg.tool_name,
-        msg.arguments,
-        msg.result
-      ));
-    } else {
-      messagesEl.appendChild(createMsgEl(msg.role, msg.content));
+    try {
+      if (msg._type === 'tool') {
+        messagesEl.appendChild(createToolCard(
+          msg.call_id || `${msg.tool_name || 'tool'}_${i}`,
+          msg.tool_name || 'unknown',
+          msg.arguments || {},
+          msg.result || msg.content || ''
+        ));
+      } else {
+        messagesEl.appendChild(createMsgEl(msg.role, msg.content || ''));
+      }
+    } catch (e) {
+      messagesEl.appendChild(createMsgEl('assistant', `⚠️ 渲染错误: ${escapeHtml(e.message)}`));
     }
   }
   scrollBottom();
