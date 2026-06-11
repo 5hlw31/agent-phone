@@ -633,6 +633,7 @@ body {
   <div class="input-area">
     <textarea id="userInput" rows="1" placeholder="输入消息…" autofocus></textarea>
     <button id="sendBtn">发送</button>
+    <button id="stopBtn" style="display:none;background:var(--danger);">停止</button>
   </div>
 </div>
 
@@ -693,6 +694,7 @@ const $$ = (sel) => document.querySelectorAll(sel);
 const messagesEl     = $('#messages');
 const userInput      = $('#userInput');
 const sendBtn        = $('#sendBtn');
+const stopBtn        = $('#stopBtn');
 const convList       = $('#convList');
 const menuBtn        = $('#menuBtn');
 const sidebar        = $('#sidebar');
@@ -862,10 +864,34 @@ async function loadConversation(id) {
 /* ------------------------------------------------------------------ */
 /* SSE streaming sender                                                */
 /* ------------------------------------------------------------------ */
+let abortController = null;
+
+function stopStreaming() {
+  STATE.streaming = false;
+  if (abortController) {
+    abortController.abort();
+    abortController = null;
+  }
+  sendBtn.style.display = '';
+  stopBtn.style.display = 'none';
+  sendBtn.disabled = false;
+  userInput.disabled = false;
+  userInput.focus();
+  removeTyping();
+}
+
+stopBtn.addEventListener('click', () => {
+  stopStreaming();
+});
+
+/* SSE streaming sender                                                */
+/* ------------------------------------------------------------------ */
 async function sendMessage(text) {
   if (STATE.streaming || !text.trim()) return;
 
   STATE.streaming = true;
+  sendBtn.style.display = 'none';
+  stopBtn.style.display = '';
   sendBtn.disabled = true;
   userInput.disabled = true;
   userInput.value = '';
@@ -909,6 +935,8 @@ async function sendMessage(text) {
     assistantContent = '';
   }
 
+  abortController = new AbortController();
+
   try {
     const res = await fetch('/api/chat/send', {
       method: 'POST',
@@ -917,6 +945,7 @@ async function sendMessage(text) {
         conversation_id: STATE.activeId || null,
         message: text,
       }),
+      signal: abortController.signal,
     });
 
     if (!res.ok) {
@@ -929,9 +958,9 @@ async function sendMessage(text) {
     let buffer = '';
     let currentEvent = 'message';
 
-    while (true) {
+    while (STATE.streaming) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done || !STATE.streaming) break;
 
       buffer += decoder.decode(value, { stream: true });
 
@@ -1016,12 +1045,19 @@ async function sendMessage(text) {
       }
     }
   } catch (err) {
+    if (err.name === 'AbortError') {
+      // user clicked stop — do nothing, already handled in stopStreaming()
+      return;
+    }
     removeTyping();
     finalizeAssistant();
     messagesEl.appendChild(createMsgEl('assistant', `❌ ${escapeHtml(err.message || '连接失败')}`));
     scrollBottom();
   } finally {
+    abortController = null;
     STATE.streaming = false;
+    sendBtn.style.display = '';
+    stopBtn.style.display = 'none';
     sendBtn.disabled = false;
     userInput.disabled = false;
     userInput.focus();
