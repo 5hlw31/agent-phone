@@ -45,8 +45,20 @@ MAX_READ_BYTES = 10 * 1024 * 1024
 
 # Commands allowed via run_command — only safe, read-oriented commands.
 # Each entry maps the binary name to itself (no shell wrappers).
+#
+# Security design:
+#   - curl/wget removed — use web_fetch which has SSRF protection
+#   - File-reading commands (cat/head/tail/grep/find) have path args validated
+#     against ALLOWED_READ_PATHS before execution
+#   - File-writing commands (cp/mv/touch/mkdir) have path args validated
+#     against ALLOWED_WRITE_PATHS
+
+# Commands whose file-path arguments must be validated
+_PATH_READ_COMMANDS = {"cat", "head", "tail", "grep", "find", "file", "wc"}
+_PATH_WRITE_COMMANDS = {"cp", "mv", "touch", "mkdir"}
+
 ALLOWED_COMMANDS: dict[str, str] = {
-    # File listing & viewing
+    # File listing & viewing (paths validated at runtime)
     "ls": "/bin/ls",
     "cat": "/bin/cat",
     "head": "/bin/head",
@@ -57,7 +69,7 @@ ALLOWED_COMMANDS: dict[str, str] = {
     "tree": "/usr/bin/tree",
     "file": "/usr/bin/file",
     "stat": "/usr/bin/stat",
-    # System info
+    # System info (no file args)
     "pwd": "/bin/pwd",
     "date": "/bin/date",
     "uptime": "/usr/bin/uptime",
@@ -67,10 +79,8 @@ ALLOWED_COMMANDS: dict[str, str] = {
     "du": "/usr/bin/du",
     "free": "/usr/bin/free",
     "ps": "/bin/ps",
-    # Network diagnostics
+    # Network diagnostics (curl/wget removed — use web_fetch)
     "ping": "/bin/ping",
-    "curl": "/usr/bin/curl",
-    "wget": "/usr/bin/wget",
     "ss": "/bin/ss",
     "ip": "/bin/ip",
     "journalctl": "/bin/journalctl",
@@ -109,6 +119,37 @@ def _in_allowed(path: str, allowed_roots: list[str]) -> Path:
                for r in roots):
         raise PermissionError(f"Path not allowed: {path}")
     return p
+
+
+def _validate_command_args(base: str, args: list[str]) -> str | None:
+    """
+    Validate file-path arguments for path-sensitive commands.
+    Returns an error string on violation, None if OK.
+
+    For each argument, if it looks like an absolute path or contains a path
+    separator, validate it against the appropriate allowed-roots set.
+    Reject any argument containing '..' (traversal attempt).
+    """
+    if base in _PATH_WRITE_COMMANDS:
+        allowed = ALLOWED_WRITE_PATHS
+    elif base in _PATH_READ_COMMANDS:
+        allowed = ALLOWED_READ_PATHS
+    else:
+        return None  # not a path-sensitive command
+
+    for arg in args:
+        # Reject traversal attempts in any argument
+        if ".." in arg:
+            return f"[BLOCKED] Path traversal detected in argument: {arg}"
+        # Only check arguments that look like paths
+        if not (arg.startswith("/") or arg.startswith("~") or "/" in arg):
+            continue
+        try:
+            _in_allowed(arg, allowed)
+        except PermissionError:
+            return f"[BLOCKED] Path not allowed for '{base}': {arg}"
+
+    return None
 
 
 def _safe_open(path: str, mode: str, allowed_roots: list[str]):
@@ -162,7 +203,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "description": (
                 "Run a shell command on the server and return its stdout + stderr. "
                 "Only allowlisted commands are permitted (no shell pipes/redirects). "
-                "The command runs with a 15-second timeout."
+                "The command runs with a 15-second timeout. "
+                "File-reading commands (cat, grep, etc.) are restricted to /opt/agent and /tmp. "
+                "For web requests use web_fetch (SSRF-protected) instead of curl/wget."
             ),
             "parameters": {
                 "type": "object",
@@ -566,6 +609,11 @@ async def _run_command(command: str, working_dir: str = "/opt/agent") -> str:
         cwd = str(_in_allowed(working_dir, ALLOWED_READ_PATHS))
     except PermissionError:
         return f"[BLOCKED] Working directory not allowed: {working_dir}"
+
+    # Validate file-path arguments for path-sensitive commands
+    path_err = _validate_command_args(base, parts[1:])
+    if path_err is not None:
+        return path_err
 
     try:
         proc = await asyncio.create_subprocess_exec(
