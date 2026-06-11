@@ -672,11 +672,11 @@ async def _write_file(path: str, content: str) -> str:
 
 
 async def _web_search(query: str, max_results: int = 5) -> str:
-    """Search DuckDuckGo (no API key needed)."""
+    """Search DuckDuckGo via the ddgs package (no API key needed)."""
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
     except ImportError:
-        return "[ERROR] duckduckgo-search not installed. Run: pip install duckduckgo-search"
+        return "[ERROR] ddgs not installed. Run: pip install ddgs"
 
     try:
         limit = min(max_results, 10)
