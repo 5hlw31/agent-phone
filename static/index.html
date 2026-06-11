@@ -1098,6 +1098,7 @@ $('#newChatBtn').addEventListener('click', () => {
   STATE.messages = [];
   chatTitle.textContent = '新对话';
   renderMessages();
+  renderConvList();
   closeSidebar();
   userInput.focus();
 });
