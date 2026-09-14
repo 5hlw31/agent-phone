@@ -1,6 +1,9 @@
 # Secrets — never commit
 .env
 
+# Runtime data — conversation DB, never commit (contains chat history)
+data/
+
 # Python
 __pycache__/
 *.pyc
