@@ -16,3 +16,27 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Current runtime and generated files
+.env
+data/
+workspace/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local artifacts and credentials
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+*.db.lock
+*.sqlite3
+*.sqlite3-*
+*.pem
+*.key
+.DS_Store
+.coverage
+htmlcov/

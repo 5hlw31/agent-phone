@@ -16,179 +16,59 @@ from __future__ import annotations
 import asyncio
 import difflib
 import fnmatch
+import json
+import logging
 import os
 import re
 import shlex
+import signal
 import stat as stat_module
 from pathlib import Path
 from typing import Any
+from workspace import Workspace
+from change_journal import observe_write
+import weakref
+import contextvars
+from contextlib import contextmanager
+import importlib.util
+
+logger = logging.getLogger("agent-phone.tools")
 
 # ---------------------------------------------------------------------------
 # Safety configuration
 # ---------------------------------------------------------------------------
 
-# Directories where file read is permitted
-ALLOWED_READ_PATHS: list[str] = [
-    "/opt/agent",
-    "/tmp",
-]
+WORKSPACE_ROOT = Path(os.getenv("AGENT_WORKSPACE", str(Path(__file__).resolve().parent / "workspace"))).resolve()
+_CURRENT_WORKSPACE = contextvars.ContextVar('agent_workspace', default=Workspace(WORKSPACE_ROOT))
 
-# Directories where file write is permitted (subset of read paths)
-ALLOWED_WRITE_PATHS: list[str] = [
-    "/opt/agent/workspace",
-    "/opt/agent/data",
-    "/tmp",
-]
+
+class _WorkspaceProxy:
+    def __getattr__(self, name):
+        return getattr(_CURRENT_WORKSPACE.get(), name)
+
+
+WS = _WorkspaceProxy()
+
+
+@contextmanager
+def using_workspace(workspace):
+    token = _CURRENT_WORKSPACE.set(workspace)
+    try:
+        yield
+    finally:
+        _CURRENT_WORKSPACE.reset(token)
 
 # Maximum file size for reads (10 MB)
 MAX_READ_BYTES = 10 * 1024 * 1024
 
-# Commands allowed via run_command — only safe, read-oriented commands.
-# Each entry maps the binary name to itself (no shell wrappers).
-#
-# Security design:
-#   - curl/wget removed — use web_fetch which has SSRF protection
-#   - File-reading commands (cat/head/tail/grep/find) have path args validated
-#     against ALLOWED_READ_PATHS before execution
-#   - File-writing commands (cp/mv/touch/mkdir) have path args validated
-#     against ALLOWED_WRITE_PATHS
-
-# Commands whose file-path arguments must be validated
-_PATH_READ_COMMANDS = {"cat", "head", "tail", "grep", "find", "file", "wc"}
-_PATH_WRITE_COMMANDS = {"cp", "mv", "touch", "mkdir"}
-
-ALLOWED_COMMANDS: dict[str, str] = {
-    # File listing & viewing (paths validated at runtime)
-    "ls": "/bin/ls",
-    "cat": "/bin/cat",
-    "head": "/bin/head",
-    "tail": "/bin/tail",
-    "wc": "/bin/wc",
-    "find": "/bin/find",
-    "grep": "/bin/grep",
-    "tree": "/usr/bin/tree",
-    "file": "/usr/bin/file",
-    "stat": "/usr/bin/stat",
-    # System info (no file args)
-    "pwd": "/bin/pwd",
-    "date": "/bin/date",
-    "uptime": "/usr/bin/uptime",
-    "uname": "/bin/uname",
-    "hostname": "/bin/hostname",
-    "df": "/bin/df",
-    "du": "/usr/bin/du",
-    "free": "/usr/bin/free",
-    "ps": "/bin/ps",
-    # Network diagnostics (curl/wget removed — use web_fetch)
-    "ping": "/bin/ping",
-    "ss": "/bin/ss",
-    "ip": "/bin/ip",
-    "journalctl": "/bin/journalctl",
-    "systemctl": "/bin/systemctl",
-    # Package & dev
-    "python3": "/usr/bin/python3",
-    "python": "/usr/bin/python",
-    "node": "/usr/bin/node",
-    "npm": "/usr/bin/npm",
-    "pip3": "/usr/bin/pip3",
-    "pip": "/usr/bin/pip",
-    "git": "/usr/bin/git",
-    "echo": "/bin/echo",
-    "mkdir": "/bin/mkdir",
-    "touch": "/usr/bin/touch",
-    "cp": "/bin/cp",
-    "mv": "/bin/mv",
-}
+# File paths are checked by the same Workspace policy used by HTTP routes.
 
 # ---------------------------------------------------------------------------
 # Path helpers (TOCTOU-safe)
 # ---------------------------------------------------------------------------
 
-def _in_allowed(path: str, allowed_roots: list[str]) -> Path:
-    """
-    Resolve *path* and verify it lies inside one of *allowed_roots*.
-    Returns the resolved Path on success, raises PermissionError otherwise.
-    """
-    p = Path(path).expanduser()
-    if not p.is_absolute():
-        p = Path("/opt/agent") / p
-    p = p.resolve()
-
-    roots = [Path(r).expanduser().resolve() for r in allowed_roots]
-    if not any(str(p).startswith(str(r) + os.sep) or str(p) == str(r)
-               for r in roots):
-        raise PermissionError(f"Path not allowed: {path}")
-    return p
-
-
-def _validate_command_args(base: str, args: list[str]) -> str | None:
-    """
-    Validate file-path arguments for path-sensitive commands.
-    Returns an error string on violation, None if OK.
-
-    For each argument, if it looks like an absolute path or contains a path
-    separator, validate it against the appropriate allowed-roots set.
-    Reject any argument containing '..' (traversal attempt).
-    """
-    if base in _PATH_WRITE_COMMANDS:
-        allowed = ALLOWED_WRITE_PATHS
-    elif base in _PATH_READ_COMMANDS:
-        allowed = ALLOWED_READ_PATHS
-    else:
-        return None  # not a path-sensitive command
-
-    for arg in args:
-        # Reject traversal attempts in any argument
-        if ".." in arg:
-            return f"[BLOCKED] Path traversal detected in argument: {arg}"
-        # Only check arguments that look like paths
-        if not (arg.startswith("/") or arg.startswith("~") or "/" in arg):
-            continue
-        try:
-            _in_allowed(arg, allowed)
-        except PermissionError:
-            return f"[BLOCKED] Path not allowed for '{base}': {arg}"
-
-    return None
-
-
-def _safe_open(path: str, mode: str, allowed_roots: list[str]):
-    """
-    Open a file after TOCTOU-safe path validation.
-    Returns (file_object, resolved_path).
-    """
-    resolved = _in_allowed(path, allowed_roots)
-
-    # Refuse devices, FIFOs, sockets
-    try:
-        st = resolved.stat()
-    except FileNotFoundError:
-        if "r" in mode and "w" not in mode:
-            raise
-        # writing can create
-    else:
-        if stat_module.S_ISBLK(st.st_mode) or stat_module.S_ISCHR(st.st_mode):
-            raise PermissionError(f"Block/character device not allowed: {path}")
-        if stat_module.S_ISFIFO(st.st_mode):
-            raise PermissionError(f"Named pipe not allowed: {path}")
-        if stat_module.S_ISSOCK(st.st_mode):
-            raise PermissionError(f"Socket not allowed: {path}")
-        # Size check for reads
-        if "r" in mode and "w" not in mode and st.st_size > MAX_READ_BYTES:
-            raise PermissionError(
-                f"File too large ({st.st_size} bytes, max {MAX_READ_BYTES})"
-            )
-
-    fh = open(resolved, mode, encoding="utf-8", errors="replace")
-
-    # TOCTOU re-check: verify the opened file's real path
-    real = Path(fh.name).resolve()
-    if not any(str(real).startswith(str(r) + os.sep) or str(real) == str(r)
-               for r in roots):
-        fh.close()
-        raise PermissionError(f"Symlink escape blocked: {path} → {real}")
-
-    return fh, resolved
+def _safe_open(path: str):
+    return WS.open_text(path), WS.path(path)
 
 
 # ---------------------------------------------------------------------------
@@ -213,13 +93,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "command": {
                         "type": "string",
                         "description": (
-                            "The command with arguments, e.g. 'ls -la /opt/agent'. "
+                            "The command with arguments, e.g. 'ls -la'. "
                             "Only allowlisted commands are permitted."
                         ),
                     },
                     "working_dir": {
                         "type": "string",
-                        "description": "Optional working directory. Defaults to /opt/agent.",
+                        "description": "Optional directory inside the workspace. Defaults to the workspace root.",
                     },
                 },
                 "required": ["command"],
@@ -232,7 +112,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "name": "read_file",
             "description": (
                 "Read the contents of a file on the server. "
-                "Paths are restricted to /opt/agent and /tmp. "
+                "Only files inside the configured workspace are accessible. "
                 "Maximum file size is 10 MB."
             ),
             "parameters": {
@@ -257,14 +137,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "name": "write_file",
             "description": (
                 "Create or overwrite a file on the server. "
-                "Paths are restricted to /opt/agent/data/ and /tmp."
+                "Files are saved atomically inside the configured workspace."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "File path to write to (relative to /opt/agent/data/ if not absolute).",
+                        "description": "Path relative to the workspace root.",
                     },
                     "content": {
                         "type": "string",
@@ -348,7 +228,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     },
                     "path": {
                         "type": "string",
-                        "description": "搜索目录，默认 /opt/agent/workspace。",
+                        "description": "搜索目录，默认工作区根目录。",
                     },
                     "glob": {
                         "type": "string",
@@ -371,7 +251,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "搜索根目录，默认 /opt/agent/workspace。",
+                        "description": "搜索根目录，默认工作区根目录。",
                     },
                     "glob": {
                         "type": "string",
@@ -587,103 +467,143 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 # Tool executors
 # ---------------------------------------------------------------------------
 
-async def _run_command(command: str, working_dir: str = "/opt/agent") -> str:
-    """Execute a command via subprocess_exec with an explicit allowlist."""
+async def _communicate_or_stop(proc, timeout: float, max_output_bytes: int = 65536):
+    """Capture bounded output from an owned process group; reap on every error."""
+    async def read(reader):
+        pieces=[];size=0
+        while True:
+            part=await reader.read(8192)
+            if not part:
+                return b''.join(pieces)
+            size+=len(part)
+            if size>max_output_bytes:
+                raise ValueError('工具输出超过读取限制。')
+            pieces.append(part)
+    stdout=asyncio.create_task(read(proc.stdout))
+    stderr=asyncio.create_task(read(proc.stderr))
+    waiter=asyncio.create_task(proc.wait())
+    output=asyncio.gather(stdout,stderr,waiter)
     try:
-        parts = shlex.split(command)
-    except ValueError as e:
-        return f"[ERROR] Invalid command syntax: {e}"
+        result=await asyncio.wait_for(asyncio.shield(output),timeout)
+        return result[0],result[1]
+    except BaseException:
+        try:
+            if os.name=='posix':
+                os.killpg(proc.pid,signal.SIGKILL)
+            elif proc.returncode is None:
+                proc.kill()
+        except ProcessLookupError:
+            pass
+        except OSError:
+            if proc.returncode is None:
+                proc.kill()
+        for task in (stdout,stderr):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(stdout,stderr,return_exceptions=True)
+        async def discard(reader):
+            while await reader.read(8192):
+                pass
+        try:
+            await asyncio.wait_for(asyncio.gather(discard(proc.stdout),discard(proc.stderr),waiter),3)
+        except TimeoutError:
+            # Closing pipes is a last resort if an unrelated descendant kept them open.
+            for reader in (proc.stdout,proc.stderr):
+                transport=getattr(reader,'_transport',None)
+                if transport:
+                    transport.close()
+            await proc.wait()
+        await asyncio.gather(output,return_exceptions=True)
+        raise
 
-    if not parts:
-        return "[ERROR] Empty command"
 
-    base = parts[0]
-    if base not in ALLOWED_COMMANDS:
-        return (
-            f"[BLOCKED] Command '{base}' is not in the allowlist.\n"
-            f"Allowed: {', '.join(sorted(ALLOWED_COMMANDS.keys()))}"
-        )
-
-    # Validate working_dir
+async def _run_command(command: str, working_dir: str = "") -> str:
+    """A small workspace command adapter, never an unrestricted host shell."""
     try:
-        cwd = str(_in_allowed(working_dir, ALLOWED_READ_PATHS))
-    except PermissionError:
-        return f"[BLOCKED] Working directory not allowed: {working_dir}"
-
-    # Validate file-path arguments for path-sensitive commands
-    path_err = _validate_command_args(base, parts[1:])
-    if path_err is not None:
-        return path_err
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            ALLOWED_COMMANDS[base],
-            *parts[1:],               # args only — no shell interpolation
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=15
-        )
-        out = stdout.decode("utf-8", errors="replace").strip()
-        err = stderr.decode("utf-8", errors="replace").strip()
-
-        parts_out: list[str] = []
-        if out:
-            parts_out.append(out)
-        if err:
-            parts_out.append(f"[stderr]\n{err}")
-        if not parts_out:
-            parts_out.append(f"(exit code {proc.returncode})")
-        return "\n".join(parts_out)
-    except asyncio.TimeoutError:
-        return "[TIMEOUT] Command exceeded 15 seconds — killed."
-    except FileNotFoundError:
-        return f"[ERROR] Command binary not found: {ALLOWED_COMMANDS.get(base, base)}"
-    except Exception as exc:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        parts = list(lexer)
+        if not parts:
+            return "[ERROR] Empty command"
+        if any(set(part) <= set(";&|<>") for part in parts):
+            return "[ERROR] 请逐条运行命令，不支持 shell 组合或重定向。"
+        cwd = WS.path(working_dir)
+        base, args = parts[0], parts[1:]
+        def file_path(value):
+            return str(WS.path(str(cwd / value) if not Path(value).is_absolute() else value))
+        if base == "pwd" and not args:
+            return str(cwd)
+        if base == "echo":
+            return " ".join(args)
+        if base == "ls":
+            paths = [arg for arg in args if not arg.startswith('-')]
+            if any(arg.startswith('-') and arg not in ('-l','-a','-la','-al') for arg in args) or len(paths)>1:
+                return "[ERROR] ls 只支持 -l、-a 和一个工作区目录。"
+            return _list_directory(Path(file_path(paths[0])) if paths else cwd, 200)
+        if base in ("cat", "head", "tail", "wc"):
+            count = 100 if base == "cat" else 10
+            if base in ("head", "tail") and len(args)>=2 and args[0] in ('-n','--lines'):
+                count = max(1, min(int(args[1]),500)); args=args[2:]
+            wc_mode = '-l'
+            if base == 'wc' and args and args[0] in ('-l','-w','-c'):
+                wc_mode=args.pop(0)
+            if len(args)!=1 or args[0].startswith('-'):
+                return "[ERROR] 请提供一个工作区文件；复杂查找请用专用工具。"
+            text = WS.read_text(file_path(args[0]))
+            if base == 'wc':
+                value = len(text.splitlines()) if wc_mode=='-l' else len(text.split()) if wc_mode=='-w' else len(text.encode('utf-8'))
+                return str(value)
+            lines=text.splitlines()
+            return '输出：\n'+('\n'.join(lines[-count:] if base=='tail' else lines[:count]) or '(empty file)')
+        return "[BLOCKED] 当前命令工具支持工作区内的 ls、cat、head、tail、wc、pwd、echo。文件修改请用专用工具。"
+    except PermissionError as exc:
+        return f"[BLOCKED] {exc}"
+    except (OSError, ValueError) as exc:
         return f"[ERROR] {exc}"
 
 
-async def _read_file(path: str, max_lines: int = 200) -> str:
-    """Read a file with TOCTOU-safe path validation."""
+async def _read_file(path: str, max_lines: int = 200, start_line: int = 1) -> str:
     try:
-        fh, resolved = _safe_open(path, "r", ALLOWED_READ_PATHS)
-    except PermissionError as e:
-        return f"[BLOCKED] {e}"
+        resolved=WS.path(path)
+        if resolved.is_dir():
+            return _list_directory(resolved,max_lines)
+        source=resolved.relative_to(WS.root)
+        document=resolved.suffix.lower() in ('.pdf','.docx')
+        if document:
+            if not resolved.exists():return f'[ERROR] 文件不存在：{path}'
+            path=str(source)+'.text.md'
+            if not WS.path(path).is_file():
+                return '[ERROR] 此文档没有提取到可读取的正文。扫描件暂不支持 OCR，请用上传入口处理文字版文档。'
+            resolved=WS.path(path)
+        with WS.open_text(path) as file:
+            selected=[];last=0;more=False
+            for number,line in enumerate(file,1):
+                last=number
+                if number<start_line:
+                    continue
+                if len(selected)>=max_lines:
+                    more=True;break
+                selected.append(line.rstrip('\n'))
+            if not selected:
+                return '(empty file)' if last==0 else '[ERROR] 起始行超过文件总行数。'
+            result='\n'.join(selected)
+            if more:
+                result+=f'\n[后续内容可从第 {start_line+len(selected)} 行继续读取]'
+            header=f'文档提取正文：{source}（不包含图片；请核对原文件）' if document else f'文件：{resolved.relative_to(WS.root)}'
+            return f'{header} · 从第 {start_line} 行读取\n\n'+result
+    except PermissionError as exc:
+        return f'[BLOCKED] {exc}'
     except FileNotFoundError:
-        return f"[ERROR] File not found: {path}"
-    except Exception as e:
-        return f"[ERROR] {e}"
-
-    try:
-        with fh:
-            if resolved.is_dir():
-                return _list_directory(resolved, max_lines)
-
-            limit = min(max_lines, 500)
-            lines_out: list[str] = []
-            byte_count = 0
-            for i, line in enumerate(fh):
-                if i >= limit:
-                    lines_out.append(f"... (truncated, {limit} lines shown)")
-                    break
-                byte_count += len(line.encode("utf-8"))
-                if byte_count > MAX_READ_BYTES:
-                    lines_out.append("... (truncated, max byte limit reached)")
-                    break
-                lines_out.append(line.rstrip("\n"))
-            return "\n".join(lines_out) if lines_out else "(empty file)"
-    except UnicodeDecodeError:
-        return f"[ERROR] Binary file — cannot read as text: {resolved}"
-    except Exception as exc:
-        return f"[ERROR] {exc}"
+        return f'[ERROR] 文件不存在：{path}'
+    except (OSError,ValueError) as exc:
+        return f'[ERROR] {exc}'
 
 
 def _list_directory(resolved: Path, max_entries: int) -> str:
     """Return a directory listing."""
     try:
-        entries = sorted(resolved.iterdir())[:max_entries]
+        entries = [WS.path(entry["path"]) for entry in WS.listing(str(resolved))[:max(1,max_entries)]]
     except PermissionError:
         return f"[ERROR] Permission denied: {resolved}"
     if not entries:
@@ -701,47 +621,34 @@ def _list_directory(resolved: Path, max_entries: int) -> str:
     return f"Directory listing of {resolved}:\n" + "\n".join(lines)
 
 
-async def _write_file(path: str, content: str) -> str:
-    """Write a file with TOCTOU-safe path validation."""
+async def _write_file(path: str, content: str, overwrite: bool = False) -> str:
+    if Path(path).suffix.lower() in ('.pdf','.docx'):
+        return '[ERROR] 不支持直接写入 PDF 或 Word 原文件；请另存为 Markdown 文本。'
     try:
-        fh, resolved = _safe_open(path, "w", ALLOWED_WRITE_PATHS)
-    except PermissionError as e:
-        return f"[BLOCKED] {e}"
-    except Exception as e:
-        return f"[ERROR] {e}"
-
-    try:
-        with fh:
-            fh.write(content)
-        size = len(content.encode("utf-8"))
-        return f"Written {resolved} ({size} bytes, {content.count(chr(10)) + 1} lines)"
-    except Exception as exc:
+        if WS.path(path).exists() and not overwrite:
+            return '[ERROR] 文件已经存在。修改请用 edit_file；确需完整覆盖时显式设置 overwrite。'
+        WS.write_text(path, content)
+        return f"Written {WS.path(path)} ({len(content.encode('utf-8'))} bytes)"
+    except PermissionError as exc:
+        return f"[BLOCKED] {exc}"
+    except (OSError, ValueError) as exc:
         return f"[ERROR] {exc}"
 
 
 async def _web_search(query: str, max_results: int = 5) -> str:
-    """Search DuckDuckGo via the ddgs package (no API key needed)."""
-    try:
+    def search():
         from ddgs import DDGS
-    except ImportError:
-        return "[ERROR] ddgs not installed. Run: pip install ddgs"
-
+        with DDGS(timeout=8) as ddgs:
+            return list(ddgs.text(query,max_results=min(max_results,10)))
     try:
-        limit = min(max_results, 10)
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=limit))
-        if not results:
-            return f"No results for: {query}"
-        lines = []
-        for i, r in enumerate(results, 1):
-            title = r.get("title", "N/A")
-            href = r.get("href", "")
-            body = r.get("body", "")[:300]
-            lines.append(f"{i}. **{title}**\n   {body}\n   {href}")
-        return "\n\n".join(lines)
-    except Exception as exc:
-        return f"[ERROR] Search failed: {exc}"
-
+        async with asyncio.timeout(12):
+            results=await asyncio.to_thread(search)
+        return '\n\n'.join(f"{i}. {r.get('title','')}\n{r.get('href','')}\n{str(r.get('body',''))[:350]}" for i,r in enumerate(results,1)) or '没有找到搜索结果。'
+    except TimeoutError:
+        return '[TIMEOUT] 搜索超时。'
+    except Exception:
+        logger.exception('Web search failed')
+        return '[ERROR] 搜索暂时不可用，可以直接提供网页地址。'
 
 # ---------------------------------------------------------------------------
 # New tools: edit_file, search_code, list_files, git_*
@@ -760,8 +667,12 @@ def _render_diff(old: str, new: str, path: str) -> str:
 
 async def _edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
     """Exact string replacement with unified diff output."""
+    if Path(path).suffix.lower() in ('.pdf','.docx'):
+        return '[ERROR] 文档原文件不可直接编辑；请修改提取正文副本或另存为 Markdown。'
+    if not old_string:
+        return '[ERROR] 要替换的原文不能为空。'
     try:
-        fh, resolved = _safe_open(path, "r", ALLOWED_READ_PATHS)
+        fh, resolved = _safe_open(path)
     except PermissionError as e:
         return f"[BLOCKED] {e}"
     except FileNotFoundError:
@@ -792,10 +703,7 @@ async def _edit_file(path: str, old_string: str, new_string: str, replace_all: b
 
     # Write back via safe path
     try:
-        # reuse _safe_open for write
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        with open(resolved, "w", encoding="utf-8") as fh_out:
-            fh_out.write(new_content)
+        WS.write_text(str(resolved), new_content)
     except Exception as e:
         return f"[ERROR] Write failed: {e}"
 
@@ -808,100 +716,90 @@ async def _edit_file(path: str, old_string: str, new_string: str, replace_all: b
     )
 
 
-async def _search_code(pattern: str, path: str = "/opt/agent/workspace", glob: str | None = None) -> str:
-    """Regex grep across workspace files."""
-    try:
-        root = _in_allowed(path, ALLOWED_READ_PATHS)
-    except PermissionError:
-        return f"[BLOCKED] Path not allowed: {path}"
+def _matches_glob(name,relative,pattern):
+    return fnmatch.fnmatch(name,pattern) or fnmatch.fnmatch(relative,pattern) or (pattern.startswith('**/') and fnmatch.fnmatch(relative,pattern[3:]))
 
-    try:
-        regex = re.compile(pattern)
-    except re.error as e:
-        return f"[ERROR] Invalid regex: {e}"
 
-    results: list[str] = []
-    max_matches = 50
-    found = 0
-
+async def _search_code(pattern: str, path: str = "", glob: str | None = None) -> str:
+    """Bounded literal text search; doesn't evaluate model-provided regexes."""
     try:
-        for filepath in root.rglob("*"):
-            if found >= max_matches:
-                break
-            if not filepath.is_file():
-                continue
-            if glob and not fnmatch.fnmatch(filepath.name, glob):
-                continue
-            # Skip binary/large files
-            try:
-                if filepath.stat().st_size > 1024 * 1024:  # 1MB
+        root=WS.path(path)
+        if not root.exists():
+            return '[ERROR] 搜索路径不存在。'
+        if root.is_file():
+            lines=WS.read_text(str(root)).splitlines()
+            hits=[f"{root.name}:{number}: {line[:240]}" for number,line in enumerate(lines,1) if pattern in line]
+            return '匹配结果：\n'+'\n'.join(hits[:50]) if hits else '没有找到匹配文本。'
+        results=[];visited=0
+        for base,dirs,files in os.walk(root,followlinks=False):
+            dirs[:]=[name for name in dirs if _visible_path(str(Path(base)/name))]
+            for name in files:
+                visited+=1
+                if visited>3000:
+                    return '匹配结果：\n'+'\n'.join(results)+ '\n[已达到 3000 个文件的扫描限制]'
+                file=Path(base)/name
+                if glob and not _matches_glob(name,file.relative_to(root).as_posix(),glob):
                     continue
-            except OSError:
-                continue
-
-            try:
-                lines = filepath.read_text(encoding="utf-8", errors="replace").splitlines()
-            except Exception:
-                continue
-
-            for lineno, line in enumerate(lines, 1):
-                if found >= max_matches:
-                    break
-                if regex.search(line):
-                    rel = str(filepath.relative_to(root))
-                    results.append(f"{rel}:{lineno}: {line.strip()[:200]}")
-                    found += 1
-    except PermissionError:
-        pass
-
-    if not results:
-        return f"No matches for /{pattern}/ in {root}"
-    return "\n".join(results)
-
-
-async def _list_files(path: str = "/opt/agent/workspace", glob: str = "**/*", max_results: int = 100) -> str:
-    """Glob-based file listing."""
-    try:
-        root = _in_allowed(path, ALLOWED_READ_PATHS)
-    except PermissionError:
-        return f"[BLOCKED] Path not allowed: {path}"
-
-    limit = min(max_results, 200)
-    entries: list[str] = []
-    try:
-        for filepath in root.rglob("*"):
-            if len(entries) >= limit:
-                entries.append("... (truncated)")
-                break
-            if glob != "**/*" and not fnmatch.fnmatch(filepath.name, glob):
-                # also match against relative path for ** patterns
-                rel = str(filepath.relative_to(root))
-                if not fnmatch.fnmatch(rel, glob) and not fnmatch.fnmatch(filepath.name, glob):
+                try:
+                    if file.stat().st_size>1024*1024:
+                        continue
+                    text=WS.read_text(str(file))
+                except (OSError,ValueError,PermissionError):
                     continue
-            try:
-                st = filepath.stat()
-            except OSError:
-                continue
-            suffix = "/" if filepath.is_dir() else ""
-            size = f"{st.st_size:>8}" if not filepath.is_dir() else "       -"
-            rel = str(filepath.relative_to(root))
-            entries.append(f"  {size}  {rel}{suffix}")
-    except PermissionError:
-        pass
+                for number,line in enumerate(text.splitlines(),1):
+                    if pattern in line:
+                        results.append(f"{file.relative_to(WS.root)}:{number}: {line.strip()[:240]}")
+                        if len(results)>=50:
+                            return '匹配结果：\n'+'\n'.join(results)+'\n[已显示前 50 处匹配]'
+                if visited%30==0:
+                    await asyncio.sleep(0)
+        return '匹配结果：\n'+'\n'.join(results) if results else '没有找到匹配文本。'
+    except (OSError,ValueError,PermissionError) as exc:
+        return f"[ERROR] {exc}"
 
-    if not entries:
-        return f"No files matching '{glob}' in {root}"
-    return f"{root}/ ({len(entries)} entries):\n" + "\n".join(entries)
+
+def _visible_path(path):
+    try:
+        WS.path(path)
+        return True
+    except (ValueError,PermissionError,OSError):
+        return False
+
+
+async def _list_files(path: str = "", glob: str = "**/*", max_results: int = 100) -> str:
+    try:
+        root=WS.path(path);results=[];visited=0
+        if not root.is_dir():
+            return '[ERROR] 文件查找路径不是目录。'
+        for base,dirs,files in os.walk(root,followlinks=False):
+            dirs[:]=[name for name in dirs if _visible_path(str(Path(base)/name))]
+            for name in sorted(dirs+files):
+                visited+=1
+                file=Path(base)/name
+                if not _visible_path(str(file)):
+                    continue
+                rel=file.relative_to(root).as_posix()
+                if glob!='**/*' and not _matches_glob(name,rel,glob):
+                    continue
+                results.append(rel+('/' if file.is_dir() else ''))
+                if len(results)>=min(max_results,200):
+                    return '文件：\n'+'\n'.join(results)+'\n[结果已截断]'
+                if visited>=3000:
+                    return '文件：\n'+'\n'.join(results)+'\n[已达到扫描限制]'
+            await asyncio.sleep(0)
+        return '文件：\n'+'\n'.join(results) if results else '工作区里还没有匹配的文件。'
+    except (OSError,ValueError,PermissionError) as exc:
+        return f"[ERROR] {exc}"
 
 
 async def _git_status(**kwargs) -> str:
     """Run git status in workspace."""
-    return await _run_git(["status", "--short"])
+    return await _run_git(["status", "--short", "--ignore-submodules=all"])
 
 
 async def _git_diff(staged: bool = False, **kwargs) -> str:
     """Run git diff in workspace."""
-    args = ["diff"]
+    args = ["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all"]
     if staged:
         args.append("--staged")
     return await _run_git(args)
@@ -910,34 +808,39 @@ async def _git_diff(staged: bool = False, **kwargs) -> str:
 async def _git_log(max_count: int = 10, **kwargs) -> str:
     """Run git log in workspace."""
     return await _run_git([
-        "log", f"--max-count={min(max_count, 50)}",
+        "log", "--no-show-signature", "--no-notes", f"--max-count={min(max_count, 50)}",
         "--oneline", "--decorate",
     ])
 
 
 async def _git_commit(message: str, **kwargs) -> str:
-    """Git commit all changes in workspace."""
-    if not message or not message.strip():
-        return "[ERROR] Commit message is required"
-
-    # Stage all
-    out1 = await _run_git(["add", "-A"])
-    # Commit
-    out2 = await _run_git(["commit", "-m", message.strip()])
-    return f"{out1}\n{out2}"
+    return '[BLOCKED] 提交工具待逐文件确认流程完善。'
 
 
 async def _run_git(args: list[str]) -> str:
     """Helper: execute a git command in /opt/agent/workspace."""
-    ws = "/opt/agent/workspace"
+    ws = str(WS.root)
+    git_dir=WS.root/'.git'
+    if not git_dir.is_dir() or git_dir.is_symlink():
+        return '[ERROR] 工作区根目录不是独立的 Git 仓库。'
+    env={'PATH':os.defpath,'LANG':'C.UTF-8','GIT_CONFIG_NOSYSTEM':'1','GIT_CONFIG_GLOBAL':os.devnull,
+         'GIT_TERMINAL_PROMPT':'0','GIT_NO_LAZY_FETCH':'1'}
+    common=['git','--no-optional-locks','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false',
+            '-c','core.pager=cat','-c','core.quotePath=false','-c','log.showSignature=false',
+            '-c','diff.submodule=short']
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "git", *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=ws,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        probe=await asyncio.create_subprocess_exec(*common,'config','--local','--no-includes','--name-only',
+            '--get-regexp',r'^(filter\.|include\.|includeif\.|extensions\.partialclone|remote\..*\.promisor)',
+            stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,cwd=ws,env=env,start_new_session=True)
+        configured,_=await _communicate_or_stop(probe,timeout=5)
+        if configured:
+            return '[BLOCKED] 该仓库使用外部过滤器、额外配置或按需获取对象，暂不通过工具执行 Git。'
+        if probe.returncode not in (0,1):
+            return '[ERROR] 无法读取工作区的 Git 配置。'
+        proc=await asyncio.create_subprocess_exec(*common,*args,
+            stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE,
+            cwd=ws,env=env,start_new_session=True)
+        stdout, stderr = await _communicate_or_stop(proc, timeout=30)
         out = stdout.decode("utf-8", errors="replace").strip()
         err = stderr.decode("utf-8", errors="replace").strip()
         parts = []
@@ -947,448 +850,64 @@ async def _run_git(args: list[str]) -> str:
             parts.append(f"[stderr]\n{err}")
         if not parts:
             parts.append("(no output)")
+        if proc.returncode != 0:
+            parts.insert(0, f"[ERROR] Git exited with code {proc.returncode}.")
         return "\n".join(parts)
     except asyncio.TimeoutError:
-        return "[TIMEOUT] Git command exceeded 30 seconds."
+        return "[TIMEOUT] Git command exceeded 30 seconds — stopped."
     except FileNotFoundError:
         return "[ERROR] Git not found on server"
     except Exception as exc:
         return f"[ERROR] {exc}"
 
 
-async def _create_pptx(filename: str, title: str, slides: list[dict], subtitle: str = "") -> str:
-    """Generate a .pptx file with structured slides."""
-
-    # Validate filename
-    if not filename.endswith(".pptx"):
-        filename += ".pptx"
-    # Only allow safe characters
-    safe_name = re.sub(r"[^\w\-.]", "_", filename)
-    output_path = f"/opt/agent/workspace/{safe_name}"
-
-    try:
-        from pptx import Presentation
-        from pptx.util import Inches, Pt, Emu
-        from pptx.dml.color import RGBColor
-        from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
-    except ImportError:
-        return "[ERROR] python-pptx not installed. Run: pip install python-pptx"
-
-    prs = Presentation()
-    prs.slide_width = Inches(13.333)
-    prs.slide_height = Inches(7.5)
-
-    # ---------- color scheme ----------
-    BG_DARK   = RGBColor(0x0D, 0x11, 0x17)
-    ACCENT    = RGBColor(0x58, 0xA6, 0xFF)
-    WHITE     = RGBColor(0xFF, 0xFF, 0xFF)
-    DIM       = RGBColor(0x8B, 0x94, 0x9E)
-    GREEN     = RGBColor(0x3F, 0xB9, 0x50)
-
-    def set_slide_bg(slide, color):
-        bg = slide.background
-        fill = bg.fill
-        fill.solid()
-        fill.fore_color.rgb = color
-
-    def add_textbox(slide, left, top, width, height, text, font_size=18, bold=False, color=WHITE, alignment=PP_ALIGN.LEFT, font_name="Arial"):
-        txBox = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
-        tf = txBox.text_frame
-        tf.word_wrap = True
-        p = tf.paragraphs[0]
-        p.text = text
-        p.font.size = Pt(font_size)
-        p.font.bold = bold
-        p.font.color.rgb = color
-        p.font.name = font_name
-        p.alignment = alignment
-        return tf
-
-    def add_rich_textbox(slide, left, top, width, height, content, font_size=16, color=WHITE):
-        """Add a textbox with simple markdown-like formatting (**bold**, *italic*, `code`)."""
-        txBox = slide.shapes.add_textbox(Inches(left), Inches(top), Inches(width), Inches(height))
-        tf = txBox.text_frame
-        tf.word_wrap = True
-        tf.clear()
-
-        lines = content.split("\n")
-        for i, line in enumerate(lines):
-            if i > 0:
-                p = tf.add_paragraph()
-            else:
-                p = tf.paragraphs[0]
-
-            p.space_after = Pt(6)
-            p.alignment = PP_ALIGN.LEFT
-
-            # Parse inline formatting: **bold**, *italic*, `code`
-            parts = re.split(r"(\*\*.*?\*\*|\*.*?\*|`.*?`)", line)
-            for part in parts:
-                if part.startswith("**") and part.endswith("**"):
-                    run = p.add_run()
-                    run.text = part[2:-2]
-                    run.font.bold = True
-                    run.font.size = Pt(font_size)
-                    run.font.color.rgb = color
-                    run.font.name = "Arial"
-                elif part.startswith("*") and part.endswith("*") and not part.startswith("**"):
-                    run = p.add_run()
-                    run.text = part[1:-1]
-                    run.font.italic = True
-                    run.font.size = Pt(font_size)
-                    run.font.color.rgb = color
-                    run.font.name = "Arial"
-                elif part.startswith("`") and part.endswith("`"):
-                    run = p.add_run()
-                    run.text = part[1:-1]
-                    run.font.size = Pt(font_size - 1)
-                    run.font.color.rgb = GREEN
-                    run.font.name = "Consolas"
-                elif part:
-                    run = p.add_run()
-                    run.text = part
-                    run.font.size = Pt(font_size)
-                    run.font.color.rgb = color
-                    run.font.name = "Arial"
-
-        return tf
-
-    # ---------- slide builders ----------
-    def slide_title():
-        sl = prs.slides.add_slide(prs.slide_layouts[6])  # blank
-        set_slide_bg(sl, BG_DARK)
-        # accent line
-        line = sl.shapes.add_shape(1, Inches(1.5), Inches(2.8), Inches(2), Pt(4))  # rectangle
-        line.fill.solid()
-        line.fill.fore_color.rgb = ACCENT
-        line.line.fill.background()
-        add_textbox(sl, 1.5, 3.0, 10.3, 1.5, title, font_size=44, bold=True, color=WHITE)
-        if subtitle:
-            add_textbox(sl, 1.5, 4.3, 10.3, 0.6, subtitle, font_size=20, color=DIM)
-        add_textbox(sl, 1.5, 6.6, 5, 0.4, "Agent 制作", font_size=12, color=DIM)
-
-    def slide_toc():
-        sl = prs.slides.add_slide(prs.slide_layouts[6])
-        set_slide_bg(sl, BG_DARK)
-        add_textbox(sl, 1.5, 0.6, 10, 0.6, "目录", font_size=32, bold=True, color=WHITE)
-        add_textbox(sl, 1.5, 1.3, 2, 0.3, "─" * 15, font_size=14, color=ACCENT)
-        # extract slide titles
-        items = [s.get("title", "") for s in slides if s.get("layout") not in ("title", "toc", "end")]
-        y = 1.8
-        for i, item in enumerate(items, 1):
-            add_textbox(sl, 2.0, y, 9, 0.5, f"{i:02d}  {item}", font_size=20, color=DIM if i % 2 == 0 else WHITE)
-            y += 0.5
-        add_textbox(sl, 1.5, 6.6, 5, 0.4, "Agent 制作", font_size=12, color=DIM)
-
-    def slide_bullets(s):
-        sl = prs.slides.add_slide(prs.slide_layouts[6])
-        set_slide_bg(sl, BG_DARK)
-        add_textbox(sl, 1.5, 0.6, 10, 0.6, s.get("title", ""), font_size=32, bold=True, color=WHITE)
-        add_textbox(sl, 1.5, 1.3, 2, 0.3, "─" * 15, font_size=14, color=ACCENT)
-        # bullet points
-        content = s.get("content", "")
-        bullets = [b.strip() for b in content.split("\n") if b.strip()]
-        y = 1.8
-        for b in bullets:
-            add_rich_textbox(sl, 2.0, y, 9.5, 0.6, b, font_size=18)
-            y += 0.55
-
-    def slide_text(s):
-        sl = prs.slides.add_slide(prs.slide_layouts[6])
-        set_slide_bg(sl, BG_DARK)
-        add_textbox(sl, 1.5, 0.6, 10, 0.6, s.get("title", ""), font_size=32, bold=True, color=WHITE)
-        add_textbox(sl, 1.5, 1.3, 2, 0.3, "─" * 15, font_size=14, color=ACCENT)
-        add_rich_textbox(sl, 1.5, 1.8, 10.3, 4.8, s.get("content", ""), font_size=16)
-
-    def slide_two_column(s):
-        sl = prs.slides.add_slide(prs.slide_layouts[6])
-        set_slide_bg(sl, BG_DARK)
-        add_textbox(sl, 1.5, 0.6, 10, 0.6, s.get("title", ""), font_size=32, bold=True, color=WHITE)
-        add_textbox(sl, 1.5, 1.3, 2, 0.3, "─" * 15, font_size=14, color=ACCENT)
-        content = s.get("content", "")
-        parts = content.split("====", 1)
-        left_text = parts[0].strip() if len(parts) > 0 else ""
-        right_text = parts[1].strip() if len(parts) > 1 else ""
-        # vertical divider
-        div = sl.shapes.add_shape(1, Inches(6.6), Inches(1.8), Pt(2), Inches(4.2))
-        div.fill.solid()
-        div.fill.fore_color.rgb = ACCENT
-        div.line.fill.background()
-        add_rich_textbox(sl, 1.5, 1.8, 4.8, 4.8, left_text, font_size=16)
-        add_rich_textbox(sl, 7.0, 1.8, 4.8, 4.8, right_text, font_size=16)
-
-    def slide_quote(s):
-        sl = prs.slides.add_slide(prs.slide_layouts[6])
-        set_slide_bg(sl, BG_DARK)
-        content = s.get("content", "").strip()
-        add_rich_textbox(sl, 2.5, 2.5, 8.3, 2.5, f"「{content}」", font_size=28, color=WHITE)
-        title = s.get("title", "").strip()
-        if title:
-            add_textbox(sl, 2.5, 5.0, 8.3, 0.5, f"— {title}", font_size=16, color=DIM)
-
-    def slide_end():
-        sl = prs.slides.add_slide(prs.slide_layouts[6])
-        set_slide_bg(sl, BG_DARK)
-        add_textbox(sl, 2, 3.0, 9, 1, "谢谢", font_size=52, bold=True, color=WHITE, alignment=PP_ALIGN.CENTER)
-        add_textbox(sl, 2, 4.2, 9, 0.6, "Agent 制作", font_size=16, color=DIM, alignment=PP_ALIGN.CENTER)
-
-    # ---------- render ----------
-    layout_map = {
-        "title": slide_title,
-        "toc": slide_toc,
-        "bullets": slide_bullets,
-        "text": slide_text,
-        "two_column": slide_two_column,
-        "quote": slide_quote,
-        "end": slide_end,
-    }
-
-    rendered_one_cover = False
-    for s in slides:
-        layout = s.get("layout", "bullets")
-        # auto-insert cover if first slide isn't title
-        if not rendered_one_cover and layout != "title":
-            slide_title()
-            rendered_one_cover = True
-        if layout == "title":
-            rendered_one_cover = True
-
-        builder = layout_map.get(layout, slide_bullets)
-        builder(s)
-
-    # always end with end slide
-    slide_end()
-
-    try:
-        prs.save(output_path)
-        return f"PPT 已保存: {output_path} ({len(slides) + 2} 页，含封面和结束页)"
-    except Exception as e:
-        return f"[ERROR] 保存失败: {e}"
+async def _create_pptx(**kwargs) -> str:
+    return '[BLOCKED] 演示文稿工具待输出验收。'
 
 
-async def _create_pdf(filename: str, title: str, sections: list[dict], author: str = "") -> str:
-    """Generate a PDF document with structured sections."""
-
-    if not filename.endswith(".pdf"):
-        filename += ".pdf"
-    safe_name = re.sub(r"[^\w\-.]", "_", filename)
-    output_path = f"/opt/agent/workspace/{safe_name}"
-
-    try:
-        from fpdf import FPDF
-    except ImportError:
-        return "[ERROR] fpdf2 not installed. Run: pip install fpdf2"
-
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=20)
-
-    # ---------- helpers ----------
-    def add_page():
-        pdf.add_page()
-
-    def write_title(txt):
-        pdf.set_font("Helvetica", "B", 22)
-        pdf.multi_cell(0, 12, txt, align="C")
-        pdf.ln(4)
-
-    def write_heading(txt):
-        pdf.ln(4)
-        pdf.set_font("Helvetica", "B", 14)
-        # Underline with a line
-        y = pdf.get_y()
-        pdf.set_draw_color(88, 166, 255)  # accent blue
-        pdf.set_line_width(0.5)
-        pdf.line(20, y + 8, 190, y + 8)
-        pdf.multi_cell(0, 10, txt)
-        pdf.ln(2)
-
-    def write_body(txt):
-        pdf.set_font("Helvetica", "", 11)
-        # Parse **bold** markers
-        parts = re.split(r"(\*\*.*?\*\*)", txt)
-        for part in parts:
-            if part.startswith("**") and part.endswith("**"):
-                pdf.set_font("Helvetica", "B", 11)
-                pdf.write(5.5, part[2:-2])
-            else:
-                pdf.set_font("Helvetica", "", 11)
-                pdf.write(5.5, part)
-        pdf.ln(2)
-
-    def write_code(txt):
-        pdf.set_fill_color(240, 240, 245)
-        pdf.set_font("Courier", "", 9)
-        for line in txt.split("\n"):
-            pdf.set_x(25)
-            pdf.cell(160, 5, line, fill=True)
-            pdf.ln()
-
-    # ---------- render ----------
-    # Cover
-    add_page()
-    pdf.ln(30)
-    write_title(title)
-    if author:
-        pdf.set_font("Helvetica", "", 12)
-        pdf.cell(0, 10, author, align="C")
-        pdf.ln(14)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(139, 148, 158)
-    pdf.cell(0, 10, f"Agent 生成  |  {len(sections)} 个章节", align="C")
-
-    # Sections
-    for sec in sections:
-        add_page()
-        h = sec.get("heading", "")
-        c = sec.get("content", "")
-        write_heading(h)
-        pdf.ln(4)
-
-        # Split content into paragraphs
-        paragraphs = c.split("\n")
-        in_code = False
-        code_buf = []
-        for para in paragraphs:
-            stripped = para.strip()
-            if stripped.startswith("```"):
-                if in_code:
-                    write_code("\n".join(code_buf))
-                    code_buf = []
-                    in_code = False
-                else:
-                    in_code = True
-            elif in_code:
-                code_buf.append(para)
-            elif stripped:
-                write_body(stripped)
-            else:
-                pdf.ln(4)  # blank line = paragraph break
-
-        if in_code and code_buf:
-            write_code("\n".join(code_buf))
-
-    try:
-        pdf.output(output_path)
-        return f"PDF 已保存: {output_path} ({pdf.pages_count} 页)"
-    except Exception as e:
-        return f"[ERROR] PDF 保存失败: {e}"
+async def _create_pdf(**kwargs) -> str:
+    return '[BLOCKED] PDF 工具待中文输出验收。'
 
 
 async def _web_fetch(url: str, max_chars: int = 8000) -> str:
-    """Fetch a web page and return its main text content as Markdown."""
-    if not url.startswith(("http://", "https://")):
-        return "[ERROR] URL must start with http:// or https://"
-
-    # Block internal/private IPs to prevent SSRF
-    import ipaddress
-    from urllib.parse import urlparse
-
-    hostname = urlparse(url).hostname
-    if hostname:
-        # Block localhost and private ranges
-        blocked = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
-        if hostname in blocked:
-            return "[BLOCKED] Cannot fetch localhost URLs"
-        try:
-            ip = ipaddress.ip_address(hostname)
-            if ip.is_private or ip.is_loopback or ip.is_link_local:
-                return f"[BLOCKED] Cannot fetch private/internal IP: {hostname}"
-        except ValueError:
-            pass  # not an IP, probably a domain
-
+    from network import PublicTransport
+    import httpx
     try:
-        import httpx
-    except ImportError:
-        return "[ERROR] httpx not installed. Run: pip install httpx"
-
-    try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as cl:
-            resp = await cl.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; AgentBot/1.0)"},
-            )
-            resp.raise_for_status()
-
-        html = resp.text
-
-        # Try to extract readable content
-        try:
-            from markdownify import markdownify as md
-            text = md(html, heading_style="ATX", strip=["script", "style", "nav", "footer", "header"])
-        except ImportError:
-            # Fallback: use BeautifulSoup
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, "html.parser")
-            for tag in soup(["script", "style", "nav", "footer", "header"]):
-                tag.decompose()
-            text = soup.get_text(separator="\n", strip=True)
-
-        limit = min(max_chars, 20000)
-        if len(text) > limit:
-            text = text[:limit] + f"\n\n... (截断，原文 {len(text)} 字符)"
-
-        return text if text.strip() else "(页面无文本内容)"
-
-    except httpx.HTTPStatusError as e:
-        return f"[ERROR] HTTP {e.response.status_code}"
-    except httpx.TimeoutException:
-        return "[TIMEOUT] 请求超时 (15s)"
-    except Exception as e:
-        return f"[ERROR] {e}"
+        async with asyncio.timeout(20):
+            async with httpx.AsyncClient(transport=PublicTransport(),trust_env=False,
+                    timeout=10,follow_redirects=True,max_redirects=3) as client:
+                async with client.stream('GET',url,headers={'User-Agent':'AgentPhone/0.2','Accept':'text/html,text/plain,application/json'}) as response:
+                    response.raise_for_status()
+                    kind=response.headers.get('content-type','').lower()
+                    if kind and not any(value in kind for value in ('text/','json','xml')):
+                        return '[ERROR] 这个地址返回的不是网页或文本。'
+                    chunks=[];size=0
+                    async for part in response.aiter_bytes():
+                        size+=len(part)
+                        if size>1024*1024:
+                            return '[ERROR] 网页超过 1 MB 读取限制。'
+                        chunks.append(part)
+                    html=b''.join(chunks).decode(response.encoding or 'utf-8',errors='replace')
+        from bs4 import BeautifulSoup
+        soup=BeautifulSoup(html,'html.parser')
+        for element in soup(['script','style','nav','footer','header']):
+            element.decompose()
+        text=soup.get_text('\n',strip=True)
+        limit=min(max_chars,20000)
+        return '[网页内容，来源需自行判断]\n'+(text[:limit] or '(无文本内容)')+('\n[内容已截断]' if len(text)>limit else '')
+    except PermissionError as exc:
+        return f'[BLOCKED] {exc}'
+    except (TimeoutError,httpx.TimeoutException):
+        return '[TIMEOUT] 网页读取超时。'
+    except httpx.HTTPStatusError as exc:
+        return f'[ERROR] 网页返回 HTTP {exc.response.status_code}。'
+    except Exception:
+        logger.exception('Web fetch failed')
+        return '[ERROR] 网页读取失败。'
 
 
 async def _code_exec(code: str) -> str:
-    """Execute Python code in a restricted sandbox subprocess."""
-    if not code or not code.strip():
-        return "[ERROR] Empty code"
-
-    # Sandbox preamble: restrict dangerous operations
-    sandbox_preamble = """
-import builtins
-__builtins__ = {k: v for k, v in builtins.__dict__.items()
-    if k not in ('open', 'exec', 'eval', 'compile', 'input',
-                  '__import__', 'breakpoint')}
-import sys, os
-sys.modules['os'] = None
-sys.modules['subprocess'] = None
-sys.modules['socket'] = None
-sys.modules['requests'] = None
-sys.modules['urllib'] = None
-sys.modules['http'] = None
-sys.modules['ftplib'] = None
-sys.modules['smtplib'] = None
-sys.modules['telnetlib'] = None
-del sys, os
-"""
-
-    full_code = sandbox_preamble + "\n" + code
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "/usr/bin/python3", "-c", full_code,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
-        out = stdout.decode("utf-8", errors="replace").strip()
-        err = stderr.decode("utf-8", errors="replace").strip()
-
-        parts = []
-        if out:
-            parts.append(out)
-        if err:
-            parts.append(f"[stderr]\n{err[:500]}")
-        if not parts:
-            parts.append("(no output)")
-        parts.append(f"(exit: {proc.returncode})")
-        return "\n".join(parts)
-
-    except asyncio.TimeoutError:
-        return "[TIMEOUT] Code execution exceeded 5 seconds — killed."
-    except FileNotFoundError:
-        return "[ERROR] python3 not found"
-    except Exception as exc:
-        return f"[ERROR] {exc}"
+    return "[BLOCKED] 尚未配置独立的代码执行环境。可以先保存代码文件。"
 
 
 # ---------------------------------------------------------------------------
@@ -1414,12 +933,104 @@ EXECUTORS = {
 }
 
 
+def _argument_error(value: Any, schema: dict, label: str = "arguments") -> str | None:
+    """Validate the JSON types used by the current tool contracts."""
+    kind = schema.get("type")
+    valid = {
+        "object": isinstance(value, dict),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "boolean": isinstance(value, bool),
+    }
+    if kind not in valid or not valid[kind]:
+        return f"{label} must be {kind}."
+    if kind == "integer" and (value < schema.get("minimum", value) or value > schema.get("maximum", value)):
+        return f"{label} is outside the allowed range."
+    if "enum" in schema and value not in schema["enum"]:
+        return f"{label} is not an allowed value."
+    if kind == "object":
+        properties = schema.get("properties", {})
+        if any(key not in value for key in schema.get("required", [])):
+            return f"{label} is missing required fields."
+        if any(key not in properties for key in value):
+            return f"{label} contains unknown fields."
+        for key, child in value.items():
+            error = _argument_error(child, properties[key], f"{label}.{key}")
+            if error:
+                return error
+    elif kind == "array" and "items" in schema:
+        for index, child in enumerate(value):
+            error = _argument_error(child, schema["items"], f"{label}[{index}]")
+            if error:
+                return error
+    return None
+
+
+_TOOL_SCHEMAS = {item["function"]["name"]: item["function"]["parameters"] for item in TOOL_DEFINITIONS}
+_DISABLED = {'code_exec': '代码运行环境尚未配置', 'git_commit': '提交工具待逐文件确认流程完善',
+             'create_pdf': 'PDF 工具待中文输出验收', 'create_pptx': '演示文稿工具待输出验收'}
+_DEPENDENCIES = {'web_search':['ddgs'],'web_fetch':['httpx','bs4']}
+_LOCKS = weakref.WeakKeyDictionary()
+
+
+def write_lock():
+    loop=asyncio.get_running_loop()
+    if loop not in _LOCKS:
+        _LOCKS[loop]=asyncio.Lock()
+    return _LOCKS[loop]
+
+
+def capability_status():
+    result=[]
+    for item in TOOL_DEFINITIONS:
+        name=item['function']['name'];reason=_DISABLED.get(name,'')
+        dependency=_DEPENDENCIES.get(name)
+        if dependency and any(importlib.util.find_spec(module) is None for module in dependency):
+            reason='所需组件尚未安装'
+        result.append({'name':name,'enabled':not bool(reason),'reason':reason})
+    return result
+
+
+def available_definitions():
+    enabled={item['name'] for item in capability_status() if item['enabled']}
+    return [item for item in TOOL_DEFINITIONS if item['function']['name'] in enabled]
+
+
 async def execute_tool(name: str, arguments: dict[str, Any]) -> str:
-    """Run a single tool by name and return its result string."""
-    executor = EXECUTORS.get(name)
-    if executor is None:
+    if not isinstance(name,str):
+        return '[ERROR] 工具名称格式不正确。'
+    executor=EXECUTORS.get(name);schema=_TOOL_SCHEMAS.get(name)
+    if executor is None or schema is None:
         return f"[ERROR] Unknown tool: {name}"
+    error=_argument_error(arguments,schema)
+    if error:
+        return f"[ERROR] Invalid arguments for {name}: {error}"
+    if name in _DISABLED:
+        return f"[BLOCKED] {_DISABLED[name]}。"
     try:
-        return await executor(**arguments)
-    except TypeError as e:
-        return f"[ERROR] Bad arguments for {name}: {e}"
+        if name in ('write_file','edit_file','git_commit'):
+            async with write_lock():
+                with observe_write(WS,name,arguments.get('path','')):
+                    result=await executor(**arguments)
+        else:
+            result=await executor(**arguments)
+        return result if isinstance(result,str) else json.dumps(result,ensure_ascii=False)
+    except Exception:
+        logger.exception('Tool execution failed: %s',name)
+        return f"[ERROR] Tool execution failed: {name}."
+
+for _item in TOOL_DEFINITIONS:
+    _function=_item['function']
+    if _function['name']=='read_file':
+        _function['parameters']['properties']['start_line']={'type':'integer','minimum':1,'maximum':200000,'description':'起始行号，从 1 开始，可分段读取大文件。'}
+    if _function['name']=='write_file':
+        _function['parameters']['properties']['overwrite']={'type':'boolean','description':'默认 false。只有确实要完整替换已有文件时设置 true；局部修改优先使用 edit_file。'}
+    if _function['name']=='run_command':
+        _function['description']='在工作区内查看文件。支持 ls、cat、head、tail、wc、pwd、echo；不支持解释器、安装依赖或 shell 语法。修改文件请用专用工具。'
+    if _function['name']=='search_code':
+        _function['description']='在工作区内按字面文本查找代码，返回文件名、行号和片段。pattern 不解释为正则表达式。'
+    for _key,_bounds in {'max_lines':(1,500),'max_results':(1,200),'max_count':(1,50),'max_chars':(1,20000)}.items():
+        _property=_function['parameters'].get('properties',{}).get(_key)
+        if _property:
+            _property['minimum'],_property['maximum']=_bounds

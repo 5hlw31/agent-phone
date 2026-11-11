@@ -1,744 +1,375 @@
-"""
-FastAPI backend for the Agent Phone Assistant.
-
-Serves the static chat UI and exposes:
-  POST /api/chat/send         SSE streaming chat (with tool-calling loop)
-  GET  /api/conversations      list saved conversations
-  POST /api/conversations      create new conversation
-  GET  /api/conversations/{id} get conversation messages
-  DELETE /api/conversations/{id} delete conversation
-  GET  /api/health             health check
-
-The agent loop: user message → DeepSeek API (with tools) → execute any
-tool_calls → feed results back → repeat (max 5 rounds) → stream final answer.
-"""
-
-from __future__ import annotations
-
+"""Agent Phone: conversations, replayable runs and a bounded personal workspace."""
+from contextlib import asynccontextmanager
+import asyncio
 import json
+import hashlib
 import logging
-import os
-import sqlite3
-import threading
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+import secrets
+import time
 
-from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from openai import OpenAI
+from openai import AsyncOpenAI
 
-from tools import EXECUTORS, TOOL_DEFINITIONS, execute_tool, _in_allowed, ALLOWED_READ_PATHS, MAX_READ_BYTES
+from agent_runtime import Engine, RunManager
+from config import BASE_DIR, Settings
+from store import Conflict, Store
+from change_journal import ChangeJournal
+import tools
+from workspace import Workspace, MAX_FILE_BYTES
+from uploads import DOCUMENTS, decode_text, extract_document, unique_path, upload_kind
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+logger=logging.getLogger('agent-phone')
 
-logger = logging.getLogger("agent-phone")
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+def _display_messages(messages):
+    visible=[];cards={}
+    for message in messages:
+        role=message.get('role')
+        if role=='system':
+            continue
+        if role in ('assistant','user'):
+            if message.get('content'):
+                item={'role':role,'content':message['content']}
+                if message.get('_run_id'):
+                    item['run_id']=message['_run_id']
+                if message.get('_partial'):
+                    item['partial']=True
+                visible.append(item)
+            for call in message.get('tool_calls',[]):
+                function=call.get('function',{})
+                try:
+                    arguments=json.loads(function.get('arguments','{}'))
+                except (ValueError,TypeError):
+                    arguments={}
+                card={'role':'tool','call_id':call['id'],'tool_name':function.get('name','tool'),
+                      'arguments':arguments if isinstance(arguments,dict) else {},'result':'','status':'unknown'}
+                cards[call['id']]=card;visible.append(card)
+        elif role=='tool':
+            call_id=message.get('tool_call_id','')
+            card=cards.get(call_id)
+            if card is None:
+                card={'role':'tool','call_id':call_id,'tool_name':'tool','arguments':{}}
+                visible.append(card)
+            result=str(message.get('content',''))
+            card['result']=result
+            card['status']='cancelled' if result.startswith(('[CANCELLED]','[INTERRUPTED]','[LIMIT]')) else 'error' if result.startswith(('[ERROR]','[BLOCKED]','[TIMEOUT]')) else 'complete'
+    return visible
 
-load_dotenv()
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "5"))
-MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "4096"))
-MAX_CONVERSATIONS = int(os.getenv("MAX_CONVERSATIONS", "100"))
-MAX_MESSAGES_PER_CONV = int(os.getenv("MAX_MESSAGES_PER_CONV", "500"))
+async def body_object(request):
+    try:
+        data=bytearray()
+        async for chunk in request.stream():
+            if len(data)+len(chunk)>24*1024*1024:
+                raise HTTPException(413,'请求内容过大')
+            data.extend(chunk)
+        body=json.loads(data)
+    except (ValueError,UnicodeDecodeError):
+        raise HTTPException(400,'请求内容格式不正确')
+    if not isinstance(body,dict):
+        raise HTTPException(400,'请求内容必须是对象')
+    return body
 
-# Auth: password login → returns AUTH_TOKEN.
-# Set LOGIN_PASSWORD to enable login page. Leave empty for no-auth dev mode.
-LOGIN_PASSWORD = os.getenv("LOGIN_PASSWORD", "").strip()
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "").strip()
 
-# If LOGIN_PASSWORD is set but no AUTH_TOKEN, generate one
-if LOGIN_PASSWORD and not AUTH_TOKEN:
-    import secrets
-    AUTH_TOKEN = secrets.token_urlsafe(32)
-    logger.warning("Generated AUTH_TOKEN=%s — save this or set in .env to persist across restarts", AUTH_TOKEN)
-
-# Auth required if either LOGIN_PASSWORD or AUTH_TOKEN is set
-AUTH_REQUIRED = bool(LOGIN_PASSWORD or AUTH_TOKEN)
-
-# CORS origins — restrict in production, allow all in dev.
-CORS_ORIGINS_RAW = os.getenv("CORS_ORIGINS", "")
-CORS_ORIGINS = (
-    [o.strip() for o in CORS_ORIGINS_RAW.split(",") if o.strip()]
-    if CORS_ORIGINS_RAW
-    else ["*"]
-)
-
-SYSTEM_PROMPT = os.getenv(
-    "SYSTEM_PROMPT",
-    "你是一个运行在 Linux 服务器上的 AI 助手，类似 Claude Code。"
-    "核心能力："
-    "1) 精确编辑文件（edit_file）— 替换字符串并显示 diff"
-    "2) 搜索代码（search_code）— 正则 grep 搜索"
-    "3) 列出文件（list_files）— glob 模式匹配"
-    "4) Git 操作（git_status/diff/log/commit）— 版本控制"
-    "5) 执行命令（run_command）— 运行脚本、安装依赖"
-    "6) 读写文件（read_file/write_file）— 文件管理"
-    "7) 网页搜索（web_search）— 查文档"
-    "工作目录：/opt/agent/workspace/（你的主工作区）。"
-    "回答简洁有用。使用工具时先说明意图。用中文回复。",
-)
-
-if not DEEPSEEK_API_KEY:
-    raise RuntimeError("DEEPSEEK_API_KEY not set — create a .env file or export it.")
-
-# ---------------------------------------------------------------------------
-# OpenAI client (DeepSeek-compatible)
-# ---------------------------------------------------------------------------
-
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-
-# ---------------------------------------------------------------------------
-# Auth dependency
-# ---------------------------------------------------------------------------
-
-async def _verify_auth(request: Request) -> None:
-    """Require Bearer token if auth is enabled."""
-    if not AUTH_REQUIRED:
+async def authenticated(request: Request):
+    config=request.app.state.config
+    if not config.token:
         return
-
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
-    token = auth_header[7:]
-    if not AUTH_TOKEN or token != AUTH_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid token")
+    header=request.headers.get('Authorization','')
+    if not header.startswith('Bearer ') or not secrets.compare_digest(header[7:].encode(),config.token.encode()):
+        raise HTTPException(401,'请先登录')
 
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
+def create_app(config=None,engine=None):
+    config=config or Settings.from_env()
+    if config.password and not config.token:
+        config.token=secrets.token_urlsafe(32)
+    workspace=Workspace(config.workspace)
+    store=Store(config.database)
+    journal=ChangeJournal(store)
+    using_real_engine=engine is None
+    if engine is None:
+        def factory():
+            return AsyncOpenAI(api_key=config.api_key,base_url=config.base_url,timeout=35,max_retries=0)
+        async def execute(name,arguments):
+            with tools.using_workspace(workspace):
+                return await tools.execute_tool(name,arguments)
+        options={}
+        from urllib.parse import urlsplit
+        if urlsplit(config.base_url).hostname=='api.deepseek.com' and config.thinking in ('enabled','disabled'):
+            options['extra_body']={'thinking':{'type':config.thinking}}
+        engine=Engine(factory,execute,tools.available_definitions(),config.system_prompt,config.model,
+                      max_rounds=config.max_rounds,max_calls=config.max_calls,request_options=options)
+    manager=RunManager(store,engine,config.timeout,journal)
 
-app = FastAPI(title="Agent Phone Assistant", version="0.1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
-)
-
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# SQLite conversation store (persistent)
-# ---------------------------------------------------------------------------
-
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "agent.db")
-_db_lock = threading.Lock()
-
-def _get_db() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
-
-def _init_db() -> None:
-    with _db_lock:
-        db = _get_db()
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS conversations (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL DEFAULT '新对话',
-                messages TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        db.commit()
-        db.close()
-
-def _load_conv(conv_id: str) -> dict | None:
-    with _db_lock:
-        db = _get_db()
-        row = db.execute("SELECT * FROM conversations WHERE id=?", (conv_id,)).fetchone()
-        db.close()
-    if not row:
-        return None
-    return {
-        "id": row["id"],
-        "title": row["title"],
-        "messages": json.loads(row["messages"]),
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-    }
-
-def _save_conv(conv: dict) -> None:
-    with _db_lock:
-        db = _get_db()
-        db.execute(
-            "INSERT OR REPLACE INTO conversations (id, title, messages, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (conv["id"], conv["title"], json.dumps(conv["messages"], ensure_ascii=False),
-             conv["created_at"], conv["updated_at"]),
-        )
-        db.commit()
-        db.close()
-
-def _new_conversation(title: str = "") -> dict:
-    # Evict oldest if at capacity
-    with _db_lock:
-        db = _get_db()
-        count = db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
-        if count >= MAX_CONVERSATIONS:
-            db.execute(
-                "DELETE FROM conversations WHERE id IN (SELECT id FROM conversations ORDER BY updated_at ASC LIMIT 1)"
-            )
-            db.commit()
-        db.close()
-
-    conv = {
-        "id": uuid.uuid4().hex,
-        "title": title or "新对话",
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}],
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    _save_conv(conv)
-    return conv
-
-def _delete_conv(conv_id: str) -> None:
-    with _db_lock:
-        db = _get_db()
-        db.execute("DELETE FROM conversations WHERE id=?", (conv_id,))
-        db.commit()
-        db.close()
-
-def _list_convs() -> list[dict]:
-    with _db_lock:
-        db = _get_db()
-        rows = db.execute("SELECT id, title, created_at, updated_at, messages FROM conversations ORDER BY updated_at DESC").fetchall()
-        db.close()
-    return [
-        {
-            "id": r["id"], "title": r["title"],
-            "created_at": r["created_at"], "updated_at": r["updated_at"],
-            "message_count": len([m for m in json.loads(r["messages"]) if m["role"] != "system"]),
-        }
-        for r in rows
-    ]
-
-def _enforce_message_limit(conv: dict) -> None:
-    messages = conv["messages"]
-    cutoff = MAX_MESSAGES_PER_CONV + 1
-    if len(messages) > cutoff:
-        system = [m for m in messages if m["role"] == "system"]
-        rest = [m for m in messages if m["role"] != "system"]
-        conv["messages"] = system + rest[cutoff - 1:]
-
-
-# ---------------------------------------------------------------------------
-# Static files
-# ---------------------------------------------------------------------------
-
-static_dir = Path(__file__).resolve().parent / "static"
-static_dir.mkdir(exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
-
-
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    index_path = static_dir / "index.html"
-    if not index_path.exists():
-        return HTMLResponse("<h1>index.html not found</h1>", status_code=404)
-    return HTMLResponse(index_path.read_text(encoding="utf-8"))
-
-
-# ---------------------------------------------------------------------------
-# Agent loop
-# ---------------------------------------------------------------------------
-
-async def _agent_loop(messages: list[dict[str, Any]]):
-    """
-    Run the agent loop: call DeepSeek with tool definitions, execute any
-    tool calls, feed results back, repeat.  Yields SSE event strings.
-
-    Works on a shallow copy to avoid corrupting the conversation on abort.
-    """
-    # Shallow copy: new list of new dicts for existing entries.
-    # Inner values (strings, lists) are shared but only appended to, never mutated.
-    local_msgs = [dict(m) for m in messages]
-    rounds = 0
-
-    while rounds < MAX_TOOL_ROUNDS:
-        rounds += 1
-
-        stream = client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
-            messages=local_msgs,
-            tools=TOOL_DEFINITIONS,
-            stream=True,
-            temperature=0.7,
-        )
-
-        # --- accumulate streaming response ---
-        content_chunks: list[str] = []
-        tool_call_acc: dict[int, dict[str, Any]] = {}
-        finish_reason: str | None = None
-
-        for chunk in stream:
-            delta = chunk.choices[0].delta if chunk.choices else None
-            finish_reason = chunk.choices[0].finish_reason if chunk.choices else None
-
-            if delta and delta.content:
-                content_chunks.append(delta.content)
-                yield f"event: delta\ndata: {json.dumps({'content': delta.content})}\n\n"
-
-            if delta and delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_call_acc:
-                        tool_call_acc[idx] = {
-                            "id": tc.id or "",
-                            "function": {"name": "", "arguments": ""},
-                        }
-                    entry = tool_call_acc[idx]
-                    if tc.id:
-                        entry["id"] = tc.id
-                    if tc.function:
-                        if tc.function.name:
-                            entry["function"]["name"] += tc.function.name
-                        if tc.function.arguments:
-                            entry["function"]["arguments"] += tc.function.arguments
-
-        # --- build assistant message ---
-        assistant_msg: dict[str, Any] = {"role": "assistant"}
-        full_content = "".join(content_chunks)
-
-        if tool_call_acc and finish_reason == "tool_calls":
-            tool_calls_out: list[dict[str, Any]] = []
-            for idx in sorted(tool_call_acc.keys()):
-                tc = tool_call_acc[idx]
-                tool_calls_out.append({
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["function"]["name"],
-                        "arguments": tc["function"]["arguments"],
-                    },
-                })
-            assistant_msg["content"] = full_content or None
-            assistant_msg["tool_calls"] = tool_calls_out
-            local_msgs.append(assistant_msg)
-
-            # --- execute tools (each gets a unique call_id for frontend matching) ---
-            for i, tc in enumerate(tool_calls_out):
-                tool_name = tc["function"]["name"]
-                try:
-                    args = json.loads(tc["function"]["arguments"])
-                except json.JSONDecodeError:
-                    args = {}
-
-                call_id = f"{tc['id']}_{i}"
-
-                yield (
-                    f"event: tool_call\n"
-                    f"data: {json.dumps({'call_id': call_id, 'tool_name': tool_name, 'arguments': args})}\n\n"
-                )
-
-                result = await execute_tool(tool_name, args)
-
-                yield (
-                    f"event: tool_result\n"
-                    f"data: {json.dumps({'call_id': call_id, 'tool_name': tool_name, 'result': result})}\n\n"
-                )
-
-                local_msgs.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result,
-                })
-
-            continue  # next round — DeepSeek gets tool results
-
-        # --- final answer (no tool calls) ---
-        if full_content:
-            assistant_msg["content"] = full_content
-        else:
-            assistant_msg["content"] = "（空响应）"
-        local_msgs.append(assistant_msg)
-        break
-
-    else:
-        # max rounds hit — emit the message so the UI shows it
-        exhaustion_msg = "（已达到最大工具调用轮次，已停止。）"
-        yield f"event: delta\ndata: {json.dumps({'content': exhaustion_msg})}\n\n"
-        local_msgs.append({
-            "role": "assistant",
-            "content": exhaustion_msg,
-        })
-
-    # Commit back to the original messages list
-    messages.clear()
-    messages.extend(local_msgs)
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
-@app.post("/api/chat/send")
-async def chat_send(request: Request, _auth=Depends(_verify_auth)):
-    """
-    SSE streaming chat endpoint.
-
-    Request body (JSON):
-      { "conversation_id"?: string, "message": string }
-
-    Returns text/event-stream with events: delta, tool_call, tool_result, error, done
-    """
-    body = await request.json()
-    user_message = (body.get("message") or "").strip()
-    conv_id = body.get("conversation_id")
-
-    if not user_message:
-        raise HTTPException(status_code=400, detail="message is required")
-    if len(user_message) > MAX_INPUT_LENGTH:
-        raise HTTPException(status_code=413, detail=f"Message too long (max {MAX_INPUT_LENGTH} chars)")
-
-    # load or create conversation
-    conv = _load_conv(conv_id) if conv_id else None
-    if conv is None:
-        title = user_message[:60].replace("\n", " ")
-        conv = _new_conversation(title)
-        conv_id = conv["id"]
-
-    # append user message
-    conv["messages"].append({"role": "user", "content": user_message})
-    conv["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _enforce_message_limit(conv)
-
-    async def stream():
+    @asynccontextmanager
+    async def lifespan(app):
+        import fcntl
+        lock=open(str(config.database)+'.lock','a')
         try:
-            async for sse_event in _agent_loop(conv["messages"]):
-                yield sse_event
-            conv["updated_at"] = datetime.now(timezone.utc).isoformat()
-            _save_conv(conv)
-            yield f"event: done\ndata: {json.dumps({'conversation_id': conv_id})}\n\n"
-        except Exception:
-            logger.exception("Agent loop failed for conversation %s", conv_id)
-            yield (
-                "event: error\n"
-                f"data: {json.dumps({'message': '服务器内部错误，请重试。'})}\n\n"
-            )
+            try:
+                fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError('此版本应使用一个服务进程；该数据库已有运行中的实例。')
+            store.recover()
+            yield
+        finally:
+            await manager.shutdown()
+            lock.close()
 
-    return StreamingResponse(
-        stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    app=FastAPI(title='Agent Phone',version='0.3.0',lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
+    app.state.config=config;app.state.workspace=workspace
+    app.state.store=store;app.state.manager=manager
+    app.state.journal=journal
+    attempts={}
+    upload_slots=asyncio.Semaphore(2)
 
+    @app.exception_handler(Conflict)
+    async def conflict(request,exc):
+        return Response(json.dumps({'detail':str(exc)},ensure_ascii=False),status_code=409,media_type='application/json')
 
-@app.get("/api/conversations")
-async def list_conversations(_auth=Depends(_verify_auth)):
-    """Return all conversations (most recent first)."""
-    return {"conversations": _list_convs()}
+    @app.exception_handler(PermissionError)
+    async def denied(request,exc):
+        return Response(json.dumps({'detail':str(exc)},ensure_ascii=False),status_code=403,media_type='application/json')
 
+    @app.exception_handler(FileNotFoundError)
+    async def missing(request,exc):
+        return Response('{"detail":"文件不存在"}',status_code=404,media_type='application/json')
 
-@app.post("/api/conversations")
-async def create_conversation(request: Request, _auth=Depends(_verify_auth)):
-    """Create a new empty conversation."""
-    body = {}
-    if await request.body():
-        body = await request.json()
-    title = (body.get("title") or "").strip() or "新对话"
-    conv = _new_conversation(title)
-    return {"id": conv["id"], "title": conv["title"]}
+    @app.exception_handler(ValueError)
+    async def invalid(request,exc):
+        return Response(json.dumps({'detail':str(exc)},ensure_ascii=False),status_code=400,media_type='application/json')
 
+    @app.middleware('http')
+    async def response_headers(request,call_next):
+        response=await call_next(request)
+        response.headers['X-Content-Type-Options']='nosniff'
+        response.headers['Referrer-Policy']='same-origin'
+        if request.url.path.startswith('/static/'):
+            response.headers['Cache-Control']='no-cache'
+        response.headers['Content-Security-Policy']="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+        return response
 
-@app.get("/api/conversations/{conv_id}")
-async def get_conversation(conv_id: str, _auth=Depends(_verify_auth)):
-    """Return a conversation with all messages."""
-    conv = _load_conv(conv_id)
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    display_msgs = [m for m in conv["messages"] if m["role"] != "system"]
-    return {
-        "id": conv["id"],
-        "title": conv["title"],
-        "messages": display_msgs,
-        "created_at": conv["created_at"],
-        "updated_at": conv["updated_at"],
-    }
+    @app.get('/',response_class=HTMLResponse)
+    async def index():
+        return HTMLResponse((BASE_DIR/'static/index.html').read_text(),headers={'Cache-Control':'no-cache'})
 
+    @app.get('/api/auth/status')
+    async def auth_status():
+        return {'login_required':bool(config.token),'auth_required':bool(config.token),'password_login':bool(config.password)}
 
-@app.delete("/api/conversations/{conv_id}")
-async def delete_conversation(conv_id: str, _auth=Depends(_verify_auth)):
-    """Delete a conversation."""
-    if not _load_conv(conv_id):
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    _delete_conv(conv_id)
-    return {"ok": True}
+    @app.post('/api/auth/login')
+    async def login(request: Request):
+        body=await body_object(request)
+        password=body.get('password')
+        if not isinstance(password,str):
+            raise HTTPException(400,'请输入口令')
+        host=request.client.host if request.client else 'local'
+        stamp=time.monotonic();recent=[t for t in attempts.get(host,[]) if stamp-t<60]
+        if len(recent)>=8:
+            raise HTTPException(429,'尝试次数较多，请稍后再试')
+        recent.append(stamp);attempts[host]=recent
+        if len(attempts)>1000:
+            attempts.clear();attempts[host]=recent
+        if not config.password or not secrets.compare_digest(password.encode(),config.password.encode()):
+            raise HTTPException(403,'口令不正确')
+        attempts.pop(host,None)
+        return {'ok':True,'token':config.token}
 
+    @app.get('/api/auth/check',dependencies=[Depends(authenticated)])
+    async def auth_check():
+        return {'ok':True,'logged_in':True}
 
-@app.get("/api/files")
-async def browse_files(path: str = "", _auth=Depends(_verify_auth)):
-    """
-    Browse the file workspace. Defaults to /opt/agent/workspace/.
+    @app.get('/api/health',dependencies=[Depends(authenticated)])
+    async def health():
+        return {'status':'ok','version':app.version,'model':config.model,'model_configured':bool(config.api_key),
+                'tool_count':len(tools.available_definitions()),'tools':tools.capability_status()}
 
-    Query params:
-      path  — relative path from workspace root, or absolute within allowed paths.
+    @app.get('/api/conversations',dependencies=[Depends(authenticated)])
+    async def conversations():
+        return {'conversations':store.conversations()}
 
-    Returns JSON:
-      { type: "dir"|"file", name, path, entries?[], content? }
-    """
-    # Resolve the path
-    if not path:
-        target = "/opt/agent/workspace"
-    elif path.startswith("/"):
-        target = path
-    else:
-        target = f"/opt/agent/workspace/{path}"
+    @app.post('/api/conversations',dependencies=[Depends(authenticated)])
+    async def new_conversation(request: Request):
+        body=await body_object(request)
+        title=body.get('title','新对话')
+        if not isinstance(title,str) or len(title)>100:
+            raise HTTPException(400,'对话标题格式不正确')
+        conv=store.new_conversation(title)
+        return {'id':conv['id'],'title':conv['title']}
 
-    try:
-        resolved = _in_allowed(target, ALLOWED_READ_PATHS)
-    except PermissionError:
-        raise HTTPException(status_code=403, detail="Path not allowed")
+    @app.get('/api/conversations/{conv_id}',dependencies=[Depends(authenticated)])
+    async def conversation(conv_id: str):
+        conv=store.load(conv_id)
+        if not conv:
+            raise HTTPException(404,'对话不存在')
+        messages=_display_messages(conv['messages'])
+        run=store.latest_run(conv_id)
+        start_index=next((i for i,m in enumerate(messages) if run and m.get('run_id')==run['id']),None)
+        return {'id':conv['id'],'title':conv['title'],'messages':messages,'run':run,
+                'run_start_index':start_index,'created_at':conv['created_at'],'updated_at':conv['updated_at']}
 
-    import stat as stat_module
+    @app.delete('/api/conversations/{conv_id}',dependencies=[Depends(authenticated)])
+    async def remove_conversation(conv_id: str):
+        if not store.load(conv_id):
+            raise HTTPException(404,'对话不存在')
+        store.delete(conv_id)
+        return {'ok':True}
 
-    try:
-        st = resolved.stat()
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="File not found")
-
-    # Directory listing
-    if resolved.is_dir():
-        entries = []
+    async def start_run(request):
+        body=await body_object(request)
+        message=body.get('message');conv_id=body.get('conversation_id');request_id=body.get('request_id')
+        if not isinstance(message,str) or not message.strip():
+            raise HTTPException(400,'请输入任务内容')
+        if len(message)>12000:
+            raise HTTPException(413,'任务内容请控制在 12000 字以内')
+        if conv_id is not None and (not isinstance(conv_id,str) or not conv_id or len(conv_id)>80):
+            raise HTTPException(400,'对话编号不正确')
+        if request_id is not None and (not isinstance(request_id,str) or not request_id or len(request_id)>80):
+            raise HTTPException(400,'请求编号不正确')
+        if not config.api_key and using_real_engine:
+            raise HTTPException(503,'模型服务尚未配置')
         try:
-            for entry in sorted(resolved.iterdir()):
+            return manager.start(conv_id,message.strip(),request_id)
+        except KeyError:
+            raise HTTPException(404,'对话不存在')
+
+    @app.post('/api/runs',dependencies=[Depends(authenticated)],status_code=201)
+    async def create_run(request: Request):
+        return await start_run(request)
+
+    @app.post('/api/chat/send',dependencies=[Depends(authenticated)])
+    async def chat_send(request: Request):
+        run=await start_run(request)
+        return StreamingResponse(manager.events(run['id']),media_type='text/event-stream',
+                                 headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
+
+    @app.get('/api/runs/{run_id}',dependencies=[Depends(authenticated)])
+    async def get_run(run_id: str):
+        run=store.run(run_id)
+        if not run:
+            raise HTTPException(404,'任务不存在')
+        return run
+
+    @app.get('/api/runs/{run_id}/events',dependencies=[Depends(authenticated)])
+    async def run_events(run_id: str,request: Request,after: int=0):
+        if not store.run(run_id):
+            raise HTTPException(404,'任务不存在')
+        try:
+            after=max(after,int(request.headers.get('Last-Event-ID','0')))
+        except ValueError:
+            raise HTTPException(400,'事件编号不正确')
+        return StreamingResponse(manager.events(run_id,max(0,after)),media_type='text/event-stream',
+                                 headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
+
+    @app.get('/api/runs/{run_id}/report',dependencies=[Depends(authenticated)])
+    async def run_report(run_id: str):
+        try:
+            async with tools.write_lock():
+                return journal.report(run_id,workspace)
+        except KeyError:
+            raise HTTPException(404,'任务不存在')
+
+    @app.post('/api/runs/{run_id}/cancel',dependencies=[Depends(authenticated)])
+    async def cancel_run(run_id: str):
+        try:
+            run=manager.cancel(run_id)
+        except KeyError:
+            raise HTTPException(404,'任务不存在')
+        return {'ok':True,'run_id':run_id,'status':run['status']}
+
+    @app.get('/api/files',dependencies=[Depends(authenticated)])
+    async def files(path: str=''):
+        resolved=workspace.path(path)
+        if resolved.is_dir():
+            return {'type':'dir','name':resolved.name,'path':resolved.relative_to(workspace.root).as_posix(),
+                    'entries':workspace.listing(path)}
+        raw=workspace.read_bytes(path);content=raw.decode('utf-8',errors='replace')
+        metadata={}
+        if resolved.suffix.lower() in DOCUMENTS:
+            text_path=path+'.text.md'
+            content=workspace.read_text(text_path) if workspace.path(text_path).is_file() else ''
+            metadata={'editable':False,'readable':bool(content),'reference_path':text_path if content else None,
+                'notice':'提取的正文；排版、表格和图片请核对原文件。' if content else '没有可供助手读取的正文；可重新上传以提取文字。'}
+        return {'type':'file','path':resolved.relative_to(workspace.root).as_posix(),'name':resolved.name,
+                'content':content,'size':len(raw),'revision':hashlib.sha256(raw).hexdigest(),**metadata}
+
+    @app.post('/api/files/upload',dependencies=[Depends(authenticated)])
+    async def upload_file(request: Request,path: str):
+        if not path.strip() or len(path)>500 or any(ord(c)<32 for c in path):
+            raise HTTPException(400,'文件名格式不正确')
+        workspace.relative(path)
+        kind=upload_kind(path)
+        raw=bytearray()
+        async for chunk in request.stream():
+            if len(raw)+len(chunk)>MAX_FILE_BYTES:raise HTTPException(413,'文件超过 10 MB 限制')
+            raw.extend(chunk)
+        if not raw:raise HTTPException(400,'文件为空，请选择有内容的文件')
+        async with upload_slots:
+            if kind=='text':
+                content=decode_text(bytes(raw));notice=''
+                stored=content.encode('utf-8')
+                if len(stored)>MAX_FILE_BYTES:raise HTTPException(413,'转换为 UTF-8 后超过 10 MB，请精简文件')
+            else:
+                document=await extract_document(kind,bytes(raw));content=document['content'];notice=document['notice'];stored=bytes(raw)
+            if await request.is_disconnected():raise HTTPException(499,'上传连接已取消')
+            async with tools.write_lock():
+                saved_path=unique_path(workspace,path,document=kind!='text')
+                reference_path=saved_path if kind=='text' else saved_path+'.text.md' if content else None
+                workspace.write_bytes(saved_path,stored)
                 try:
-                    es = entry.stat()
-                    entries.append({
-                        "name": entry.name,
-                        "is_dir": entry.is_dir(),
-                        "size": es.st_size if not entry.is_dir() else 0,
-                        "mtime": int(es.st_mtime),
-                    })
-                except OSError:
-                    pass
-        except PermissionError:
-            raise HTTPException(status_code=403, detail="Permission denied")
+                    if kind!='text' and content:
+                        workspace.write_text(reference_path,f'# 文档正文\n\n原文件：{saved_path}\n\n'+(f'提取提示：{notice}\n\n' if notice else '')+content)
+                except BaseException:
+                    workspace.delete(saved_path);raise
+        return {'ok':True,'path':saved_path,'reference_path':reference_path,'size':len(stored),'kind':kind,
+                'renamed':saved_path!=path,'notice':notice,'readable':reference_path is not None}
 
-        return {
-            "type": "dir",
-            "name": resolved.name or resolved.as_posix(),
-            "path": str(resolved),
-            "entries": entries,
-        }
+    @app.post('/api/files',dependencies=[Depends(authenticated)])
+    async def save_file(request: Request):
+        body=await body_object(request);path=body.get('path');content=body.get('content','');is_dir=body.get('is_dir',False)
+        if not isinstance(path,str) or not path.strip() or not isinstance(content,str) or not isinstance(is_dir,bool):
+            raise HTTPException(400,'文件内容格式不正确')
+        if not is_dir and Path(path).suffix.lower() in DOCUMENTS:
+            raise HTTPException(400,'PDF 和 Word 请使用上传入口，正文副本可以单独编辑。')
+        async with tools.write_lock():
+            if path.endswith('/') or is_dir:
+                workspace.mkdir(path)
+            else:
+                if workspace.path(path).exists():
+                    revision=hashlib.sha256(workspace.read_bytes(path)).hexdigest()
+                    if body.get('expected_revision')!=revision:
+                        raise Conflict('文件已经存在或有新的改动，请重新读取后再保存。')
+                workspace.write_text(path,content)
+        return {'ok':True,'path':workspace.path(path).relative_to(workspace.root).as_posix()}
 
-    # File read
-    if not stat_module.S_ISREG(st.st_mode):
-        raise HTTPException(status_code=400, detail="Not a regular file")
+    @app.delete('/api/files',dependencies=[Depends(authenticated)])
+    async def delete_file(path: str,revision: str=''):
+        async with tools.write_lock():
+            target=workspace.path(path)
+            if target.is_file() and hashlib.sha256(workspace.read_bytes(path)).hexdigest()!=revision:
+                raise Conflict('文件已有新改动，请重新读取后再删除。')
+            try:
+                workspace.delete(path)
+            except OSError:
+                raise HTTPException(400,'只能删除普通文件或空目录')
+        return {'ok':True}
 
-    if st.st_size > MAX_READ_BYTES:
-        raise HTTPException(status_code=413, detail=f"File too large (>{MAX_READ_BYTES} bytes)")
+    @app.get('/api/files/download',dependencies=[Depends(authenticated)])
+    async def download(path: str):
+        data=workspace.read_bytes(path)
+        from urllib.parse import quote
+        return Response(data,media_type='application/octet-stream',headers={
+            'Content-Disposition':"attachment; filename*=UTF-8''"+quote(workspace.path(path).name)})
 
-    try:
-        content = resolved.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Cannot read as text")
-
-    return {
-        "type": "file",
-        "name": resolved.name,
-        "path": str(resolved),
-        "size": st.st_size,
-        "content": content,
-    }
-
-
-@app.post("/api/files")
-async def create_file(request: Request, _auth=Depends(_verify_auth)):
-    """
-    Create or upload a new file in the workspace.
-
-    JSON body: { "path": "dir/filename.txt", "content": "file contents..." }
-    If path ends with /, it's treated as a new directory.
-    """
-    body = await request.json()
-    filepath = (body.get("path") or "").strip()
-    content = body.get("content", "")
-
-    if not filepath:
-        raise HTTPException(status_code=400, detail="path is required")
-
-    # Resolve
-    if not filepath.startswith("/"):
-        filepath = f"/opt/agent/workspace/{filepath}"
-
-    try:
-        resolved = _in_allowed(filepath, ALLOWED_READ_PATHS)
-    except PermissionError:
-        raise HTTPException(status_code=403, detail="Path not allowed")
-
-    # Check write permission
-    from tools import ALLOWED_WRITE_PATHS, _in_allowed as _write_check
-    try:
-        _write_check(filepath, ALLOWED_WRITE_PATHS)
-    except PermissionError:
-        raise HTTPException(status_code=403, detail="Write not allowed in this path")
-
-    try:
-        if filepath.endswith("/") or body.get("is_dir"):
-            resolved.mkdir(parents=True, exist_ok=True)
-            return {"ok": True, "type": "dir", "path": str(resolved)}
-        else:
-            resolved.parent.mkdir(parents=True, exist_ok=True)
-            resolved.write_text(content, encoding="utf-8")
-            size = len(content.encode("utf-8"))
-            return {"ok": True, "type": "file", "path": str(resolved), "size": size}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    app.mount('/static',StaticFiles(directory=BASE_DIR/'static'),name='static')
+    return app
 
 
-@app.delete("/api/files")
-async def delete_file(request: Request, _auth=Depends(_verify_auth)):
-    """
-    Delete a file or empty directory in the workspace.
 
-    Query params:
-      path — absolute path to the file/directory to delete.
-    """
-    path = request.query_params.get("path", "").strip()
-    if not path:
-        raise HTTPException(status_code=400, detail="path is required")
-
-    try:
-        resolved = _in_allowed(path, ALLOWED_READ_PATHS)
-    except PermissionError:
-        raise HTTPException(status_code=403, detail="Path not allowed")
-
-    # Extra guard: don't delete the workspace root or .git
-    if resolved.as_posix() in ("/opt/agent/workspace", "/opt/agent", "/opt"):
-        raise HTTPException(status_code=403, detail="Cannot delete root directory")
-    if ".git" in resolved.parts:
-        raise HTTPException(status_code=403, detail="Cannot delete .git directory")
-
-    from tools import ALLOWED_WRITE_PATHS, _in_allowed as _write_check
-    try:
-        _write_check(str(resolved), ALLOWED_WRITE_PATHS)
-    except PermissionError:
-        raise HTTPException(status_code=403, detail="Write not allowed in this path")
-
-    try:
-        if resolved.is_dir():
-            resolved.rmdir()
-        else:
-            resolved.unlink()
-        return {"ok": True, "deleted": str(resolved)}
-    except OSError as e:
-        if resolved.is_dir():
-            raise HTTPException(status_code=400, detail=f"Directory not empty (or error): {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/files/download")
-async def download_file(path: str = "", _auth=Depends(_verify_auth)):
-    """
-    Download a file from the workspace with proper Content-Disposition header.
-    """
-    if not path:
-        raise HTTPException(status_code=400, detail="path is required")
-
-    try:
-        resolved = _in_allowed(path, ALLOWED_READ_PATHS)
-    except PermissionError:
-        raise HTTPException(status_code=403, detail="Path not allowed")
-
-    if not resolved.is_file():
-        raise HTTPException(status_code=400, detail="Not a regular file")
-
-    return FileResponse(
-        path=str(resolved),
-        filename=resolved.name,
-        media_type="application/octet-stream",
-    )
-
-
-@app.get("/api/health")
-async def health():
-    return {
-        "status": "ok",
-        "model": DEEPSEEK_MODEL,
-        "tool_count": len(EXECUTORS),
-        "conversations": len(_list_convs()),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Auth routes (login system)
-# ---------------------------------------------------------------------------
-
-@app.post("/api/auth/login")
-async def login(request: Request):
-    """
-    Login with password, returns the AUTH_TOKEN.
-    Request: { "password": "..." }
-    Response: { "token": "...", "ok": true }
-    """
-    if not LOGIN_PASSWORD:
-        raise HTTPException(status_code=400, detail="Login not configured — set LOGIN_PASSWORD in .env")
-
-    body = await request.json()
-    pw = (body.get("password") or "").strip()
-    if not pw:
-        raise HTTPException(status_code=400, detail="Password is required")
-
-    if pw != LOGIN_PASSWORD:
-        raise HTTPException(status_code=403, detail="Wrong password")
-
-    return {"ok": True, "token": AUTH_TOKEN}
-
-
-@app.get("/api/auth/check")
-async def check_auth(request: Request):
-    """
-    Check if the current request has a valid token.
-    Also returns whether login is required.
-    """
-    try:
-        await _verify_auth(request)
-        return {"ok": True, "auth_required": AUTH_REQUIRED, "logged_in": True}
-    except HTTPException:
-        return {"ok": True, "auth_required": AUTH_REQUIRED, "logged_in": False}
-
-
-@app.get("/api/auth/status")
-async def auth_status():
-    """Public: check if auth is required (no token needed)."""
-    return {
-        "login_required": bool(LOGIN_PASSWORD),
-        "auth_required": AUTH_REQUIRED,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Init
-# ---------------------------------------------------------------------------
-
-# Initialize DB on import
-_init_db()
-
-if __name__ == "__main__":
+if __name__=='__main__':
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run('main:create_app',factory=True,host='127.0.0.1',port=8000)
