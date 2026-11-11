@@ -40,3 +40,4 @@ venv/
 .DS_Store
 .coverage
 htmlcov/
+evaluations/results/

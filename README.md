@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/5hlw31/agent-phone/actions/workflows/tests.yml/badge.svg)](https://github.com/5hlw31/agent-phone/actions/workflows/tests.yml)
 
-版本 0.3.0 · [执行流程与设计](docs/architecture.md) · [验证与复现](docs/validation.md)
+版本 0.3.0 · [执行流程与设计](docs/architecture.md) · [验证与复现](docs/validation.md) · [固定任务评估](evaluations/README.md)
 
 一个用于处理个人工作区文件的 Agent 应用。可以连续调用文件、搜索和网页工具，查看执行过程，刷新后接回任务，也可以主动停止。前端使用原生 JavaScript，后端为 FastAPI，数据保存在 SQLite。
 
@@ -64,6 +64,16 @@ cp .env.example .env
 ```
 
 页面会标注“本地演示 · 模拟模型”。它使用临时目录和固定的模型回复，文件读写与 HTTP 接口仍实际执行。可用来检查操作流程，不能据此评价真实模型的任务完成质量。
+
+## 固定任务评估
+
+提供 8 个虚构文件任务，将预期结果与额外文件修改分开检查，并保存模型配置、完整可见记录和代码哈希。默认 scripted 模式不调用模型；live 模式需要显式允许 API 请求。
+
+```bash
+.venv/bin/python evaluations/run_suite.py --mode scripted --output /tmp/agent-evaluation.json
+```
+
+首轮 live 记录为正常任务 4/5、边界场景 3/3。Word 正文读取正确，但最终额外附加说明，未满足“只回复标识串”的要求；保留失败标签。设置、原始数据及局限见 [评估说明](evaluations/README.md) 和 [基线分析](evaluations/baselines/README.md)。
 
 ## 配置
 

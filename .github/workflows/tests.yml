@@ -43,5 +43,7 @@ jobs:
         run: python -m pip check
       - name: Run backend checks
         run: python -m unittest discover -s tests -v
+      - name: Check scripted evaluation pipeline
+        run: python evaluations/run_suite.py --mode scripted --output /tmp/agent-scripted-evaluation.json
       - name: Check browser script syntax
         run: node --check static/app.js

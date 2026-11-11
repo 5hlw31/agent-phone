@@ -14,9 +14,9 @@ node --check static/app.js
 
 检查不需要配置 .env 或真实模型密钥。模型采用测试流，文件、Git 临时仓库、HTTP 接口和子进程实际执行。测试用的 token、口令和文本均为固定虚构数据。
 
-本机 Python 3.12、部署服务器 Linux Python 3.11 均通过 60 项检查。覆盖范围包括参数与路径、流式调用、并发和请求去重、断流与取消、重启恢复、文档上传、网络边界和文件改动记录。
+本机 Python 3.12、部署服务器 Linux Python 3.11 均通过 67 项检查，其中 7 项用于评估判定器与调用预算。覆盖范围包括参数与路径、流式调用、并发和请求去重、断流与取消、重启恢复、文档上传、网络边界和文件改动记录。
 
-GitHub Actions 在 Python 3.11/3.12 上运行同一组检查及脚本语法检查，采用依赖快照。每次 CI 的结果以 [Actions 页面](https://github.com/5hlw31/agent-phone/actions/workflows/tests.yml)为准；本段的本机/服务器结果不代替 CI 结果。
+GitHub Actions 在 Python 3.11/3.12 上运行同一组检查、scripted 评估流程及脚本语法检查，采用依赖快照。每次 CI 的结果以 [Actions 页面](https://github.com/5hlw31/agent-phone/actions/workflows/tests.yml)为准；本段的本机/服务器结果不代替 CI 结果。
 
 ## 页面检查
 
@@ -49,3 +49,7 @@ GitHub Actions 在 Python 3.11/3.12 上运行同一组检查及脚本语法检�
 - 文件后来修改、删除或变成不可读取路径：当前核对状态改变，历史差异保留。
 
 旧 [pentest-report.md](../pentest-report.md)为早期版本记录，不能当作 0.3.0 已通过相同测试或全面安全验证的证明。
+
+## 固定任务基线补充
+
+项目现有八个虚构文件场景的独立评估运行器。模型响应、工具返回与文件结果分开保存，含判定器反例检查。首轮真实模型运行正常任务 4/5、边界场景 3/3，具体失败为 Word 场景多出说明、未满足精确输出要求；这组小样本不代表通用成功率。详见 [方法](../evaluations/README.md) 与 [原始结果分析](../evaluations/baselines/README.md)。
